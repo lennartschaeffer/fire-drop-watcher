@@ -3,12 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import Map from "react-map-gl/maplibre";
 import DeckGL from "@deck.gl/react";
-import { PolygonLayer } from "@deck.gl/layers";
+import { PolygonLayer, IconLayer } from "@deck.gl/layers";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 const INITIAL_VIEW = {
-  longitude: -119.4,
-  latitude: 50.6,
+  longitude: -64.27,
+  latitude: 45.57,
   zoom: 10,
   pitch: 0,
   bearing: 0,
@@ -38,24 +38,49 @@ interface WeatherData {
   wind_dir: string;
   temp_c: number;
   humidity: number;
+  precip_mm: number;
 }
 
 interface TerrainData {
   slope_degrees: number;
   aspect_degrees: number;
+  elevation_m?: number;
   error?: string;
+}
+
+interface FuelData {
+  fuel_type: string;
+  fuel_description: string;
+  flammability: string;
+}
+
+interface PerimeterArrow {
+  lon: number;
+  lat: number;
+  direction: number;
+  severity: number;
 }
 
 interface FireFeature {
   type: string;
   geometry: { type: string; coordinates: number[][][] };
-  properties: { center_lat: number; center_lon: number; radius_km: number; step: number };
+  properties: {
+    center_lat: number;
+    center_lon: number;
+    radius_km: number;
+    step: number;
+    fire_direction: number;
+    fire_severity: number;
+    perimeter_arrows: PerimeterArrow[];
+  };
 }
 
 interface SimulateResponse {
   frames: FireFeature[];
   weather: WeatherData;
   terrain: TerrainData;
+  fuel: FuelData;
+  prediction: { fire_direction: number; fire_severity: number };
   steps: number;
 }
 
@@ -63,11 +88,61 @@ const API = "http://localhost:8000";
 
 type SimStatus = "idle" | "loading" | "playing" | "done";
 
+// Map severity 0–1 to RGBA: low=yellow, mid=orange, high=deep red
+function severityColor(s: number): [number, number, number, number] {
+  const r = 255;
+  const g = Math.round(180 * (1 - s));
+  const b = 0;
+  return [r, g, b, Math.round(40 + 80 * s)];
+}
+
+function severityLineColor(s: number): [number, number, number, number] {
+  const r = 255;
+  const g = Math.round(160 * (1 - s));
+  const b = 0;
+  return [r, g, b, 220];
+}
+
+function severityLabel(s: number): string {
+  if (s < 0.25) return "Low";
+  if (s < 0.5)  return "Moderate";
+  if (s < 0.75) return "High";
+  return "Extreme";
+}
+
+function severityTextColor(s: number): string {
+  if (s < 0.25) return "text-yellow-400";
+  if (s < 0.5)  return "text-orange-400";
+  if (s < 0.75) return "text-orange-500";
+  return "text-red-500";
+}
+
+// Build a simple SVG arrow pointing up (north), rotated to fire_direction
+function ArrowSVG({ direction, size = 32 }: { direction: number; size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 32 32"
+      style={{ transform: `rotate(${direction}deg)`, transition: "transform 0.4s ease" }}
+    >
+      <polygon
+        points="16,2 22,22 16,18 10,22"
+        fill="#f97316"
+        stroke="#fff"
+        strokeWidth="1.5"
+      />
+    </svg>
+  );
+}
+
 export default function FireMap() {
   const [frames, setFrames] = useState<FireFeature[]>([]);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [terrain, setTerrain] = useState<TerrainData | null>(null);
+  const [fuel, setFuel] = useState<FuelData | null>(null);
+  const [prediction, setPrediction] = useState<{ fire_direction: number; fire_severity: number } | null>(null);
   const [status, setStatus] = useState<SimStatus>("idle");
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -85,6 +160,8 @@ export default function FireMap() {
       .then((data: SimulateResponse) => {
         setWeather(data.weather);
         setTerrain(data.terrain);
+        setFuel(data.fuel);
+        setPrediction(data.prediction);
         setFrames(data.frames);
         setStatus("playing");
 
@@ -105,6 +182,10 @@ export default function FireMap() {
   useEffect(() => () => { if (intervalRef.current) clearInterval(intervalRef.current); }, []);
 
   const activeFeature = frames[currentFrame] ?? null;
+  const props = activeFeature?.properties;
+  const severity = props?.fire_severity ?? 0;
+
+  const arrowData: PerimeterArrow[] = activeFeature?.properties.perimeter_arrows ?? [];
 
   const layers = activeFeature
     ? [
@@ -112,18 +193,41 @@ export default function FireMap() {
           id: "fire-perimeter",
           data: [activeFeature.geometry.coordinates[0]],
           getPolygon: (d) => d,
-          getFillColor: [255, 80, 0, 60],
-          getLineColor: [255, 140, 0, 220],
+          getFillColor: severityColor(severity),
+          getLineColor: severityLineColor(severity),
           getLineWidth: 3,
           lineWidthUnits: "pixels",
           filled: true,
           stroked: true,
           pickable: false,
+          updateTriggers: {
+            getFillColor: [severity],
+            getLineColor: [severity],
+          },
+        }),
+        new IconLayer<PerimeterArrow>({
+          id: "fire-direction-arrows",
+          data: arrowData,
+          getPosition: (d) => [d.lon, d.lat],
+          getIcon: () => ({
+            url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+              `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 32 32">
+                <polygon points="16,2 22,22 16,18 10,22" fill="#f97316" stroke="white" stroke-width="1.5"/>
+              </svg>`
+            )}`,
+            width: 64,
+            height: 64,
+            anchorX: 32,
+            anchorY: 32,
+          }),
+          getSize: 32,
+          getAngle: (d) => -d.direction,
+          billboard: false,
+          sizeUnits: "pixels",
+          updateTriggers: { getAngle: [currentFrame] },
         }),
       ]
     : [];
-
-  const props = activeFeature?.properties;
 
   return (
     <div className="relative w-full h-full">
@@ -132,7 +236,7 @@ export default function FireMap() {
       </DeckGL>
 
       <div className="absolute top-4 right-4 w-64 rounded-xl bg-black/70 text-white text-sm p-4 space-y-3 backdrop-blur-sm">
-        <h2 className="font-semibold text-base text-orange-400">Fire Zone — Okanagan</h2>
+        <h2 className="font-semibold text-base text-orange-400">Fire Zone — Nova Scotia</h2>
         <p className="text-zinc-400 text-xs">
           {lat.toFixed(4)}°N, {Math.abs(lon).toFixed(4)}°W
         </p>
@@ -163,6 +267,32 @@ export default function FireMap() {
           </div>
         )}
 
+        {prediction && status !== "idle" && (
+          <div className="space-y-1">
+            <p className="text-zinc-400 text-xs uppercase tracking-wide">Model Prediction</p>
+            <div className="grid grid-cols-2 gap-x-2 gap-y-1 items-center">
+              <span className="text-zinc-300">Severity</span>
+              <span className={`font-semibold ${severityTextColor(prediction.fire_severity)}`}>
+                {severityLabel(prediction.fire_severity)} ({(prediction.fire_severity * 100).toFixed(0)}%)
+              </span>
+              <span className="text-zinc-300">Direction</span>
+              <span className="flex items-center gap-1.5">
+                <ArrowSVG direction={prediction.fire_direction} size={18} />
+                {prediction.fire_direction.toFixed(0)}°
+              </span>
+            </div>
+            <div className="mt-1 h-1.5 rounded bg-zinc-700">
+              <div
+                className="h-1.5 rounded transition-all duration-300"
+                style={{
+                  width: `${prediction.fire_severity * 100}%`,
+                  backgroundColor: `rgb(255, ${Math.round(180 * (1 - prediction.fire_severity))}, 0)`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
         {weather && status !== "idle" && (
           <div className="space-y-1">
             <p className="text-zinc-400 text-xs uppercase tracking-wide">Weather</p>
@@ -185,7 +315,26 @@ export default function FireMap() {
               <span>{terrain.slope_degrees}°</span>
               <span className="text-zinc-300">Aspect</span>
               <span>{terrain.aspect_degrees}°</span>
+              {terrain.elevation_m !== undefined && (
+                <>
+                  <span className="text-zinc-300">Elevation</span>
+                  <span>{terrain.elevation_m} m</span>
+                </>
+              )}
             </div>
+          </div>
+        )}
+
+        {fuel && status !== "idle" && (
+          <div className="space-y-1">
+            <p className="text-zinc-400 text-xs uppercase tracking-wide">Fuel</p>
+            <div className="grid grid-cols-2 gap-x-2 gap-y-1">
+              <span className="text-zinc-300">Type</span>
+              <span>{fuel.fuel_type}</span>
+              <span className="text-zinc-300">Risk</span>
+              <span className="capitalize">{fuel.flammability}</span>
+            </div>
+            <p className="text-zinc-500 text-xs leading-tight">{fuel.fuel_description}</p>
           </div>
         )}
 

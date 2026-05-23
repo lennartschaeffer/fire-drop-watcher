@@ -53,6 +53,19 @@ def get_temperature(lat: float, lon: float) -> dict:
     }
 
 
+def get_precipitation(lat: float, lon: float) -> dict:
+    """
+    Get precipitation for a location.
+
+    Returns:
+        dict with precip_mm (float)
+    """
+    current = _fetch_current(lat, lon)
+    return {
+        "precip_mm": current.get("precip_mm", 0.0),
+    }
+
+
 def get_humidity(lat: float, lon: float) -> dict:
     """
     Get humidity for a location.
