@@ -97,14 +97,11 @@ elevation or open airspace, e.g., "Immediate right turn, exit down the valley."]
 # ---------------------------------------------------------------------------
 @dataclass
 class AAOBriefing:
-    lat: float
-    lon: float
-    text: str       # Full formatted briefing from Claude
+    text: str       # Full formatted briefing
     model: str      # Model used
 
     def __str__(self) -> str:
-        header = f"AAO BRIEFING — Drop Zone ({self.lat}, {self.lon})\n" + "=" * 60
-        return f"{header}\n{self.text}"
+        return f"AAO BRIEFING\n{'=' * 60}\n{self.text}"
 
 
 # ---------------------------------------------------------------------------
@@ -138,63 +135,30 @@ def _fetch_image_as_base64(image_url: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Public function
 # ---------------------------------------------------------------------------
-def get_aao_briefing(
-    lat: float,
-    lon: float,
-    image_path: Optional[str] = None,
-    image_url: Optional[str] = None,
-    region: Optional[str] = None,
-) -> AAOBriefing:
-    """
-    Send a map image to Claude via AWS Bedrock and get an AAO talk-in briefing.
-
-    Parameters
-    ----------
-    lat, lon : float
-        Decimal-degree coordinates of the drop zone centre.
-    image_path : str, optional
-        Path to a local map image (PNG / JPG / WEBP).
-    image_url : str, optional
-        Public URL of a map image. Used if image_path is not provided.
-    region : str, optional
-        AWS region. Falls back to AWS_DEFAULT_REGION env var, then us-east-1.
-
-    Returns
-    -------
-    AAOBriefing
-        Dataclass with the formatted briefing text and metadata.
-    """
-    if image_path is None and image_url is None:
-        raise ValueError("Provide either image_path or image_url.")
-
-    # Get image as base64
-    if image_path:
-        b64_data, mime_type = _image_to_base64(image_path)
-    else:
-        b64_data, mime_type = _fetch_image_as_base64(image_url)
-
-    # Nova image format uses short type string: "png", "jpeg", "gif", "webp"
-    image_format = mime_type.split("/")[-1]   # e.g. "image/png" → "png"
+def _build_request_body(b64_data: str, mime_type: str) -> dict:
+    """Build the Nova request body from a base64 image."""
+    image_format = mime_type.split("/")[-1]  # "image/png" → "png"
     if image_format == "jpg":
         image_format = "jpeg"
 
-    # Build the Amazon Nova request body
-    request_body = {
+    return {
         "system": [{"text": AAO_PROMPT}],
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    # Map image
                     {
                         "image": {
                             "format": image_format,
                             "source": {"bytes": b64_data},
                         }
                     },
-                    # Coordinates text
+                    # Drop zone is marked in purple on the image — no coordinates needed
                     {
-                        "text": f"Drop zone coordinates: {lat:.6f}°N, {lon:.6f}°W"
+                        "text": (
+                            "The drop zone is indicated by the purple line drawn on the map. "
+                            "Generate the AAO briefing based on that purple marker."
+                        )
                     },
                 ],
             }
@@ -205,6 +169,9 @@ def get_aao_briefing(
         },
     }
 
+
+def _invoke_nova(request_body: dict, region: Optional[str] = None) -> AAOBriefing:
+    """Send request to Nova 2 Lite on Bedrock and return an AAOBriefing."""
     aws_region = region or AWS_REGION
     model_id = _model_id(aws_region)
     client = boto3.client("bedrock-runtime", region_name=aws_region)
@@ -217,15 +184,52 @@ def get_aao_briefing(
     )
 
     result = json.loads(response["body"].read())
-    # Nova response: output → message → content → [{"text": "..."}]
     briefing_text = result["output"]["message"]["content"][0]["text"].strip()
+    return briefing_text, model_id
 
-    return AAOBriefing(
-        lat=lat,
-        lon=lon,
-        text=briefing_text,
-        model=model_id,
-    )
+
+def get_aao_briefing(
+    image_path: Optional[str] = None,
+    image_url: Optional[str] = None,
+    image_b64: Optional[str] = None,
+    mime_type: str = "image/png",
+    region: Optional[str] = None,
+) -> AAOBriefing:
+    """
+    Send a map image to Nova 2 Lite via AWS Bedrock and get an AAO talk-in briefing.
+    The drop zone must be marked in purple on the image — no coordinates required.
+
+    Parameters
+    ----------
+    image_path : str, optional
+        Path to a local map image (PNG / JPG / WEBP).
+    image_url : str, optional
+        Public URL of a map image.
+    image_b64 : str, optional
+        Already base64-encoded image data (use with mime_type).
+    mime_type : str
+        MIME type of the image when passing image_b64 (default: "image/png").
+    region : str, optional
+        AWS region. Falls back to AWS_DEFAULT_REGION env var, then us-east-1.
+
+    Returns
+    -------
+    AAOBriefing
+        Dataclass with the formatted briefing text and metadata.
+    """
+    if image_b64:
+        b64_data, img_mime = image_b64, mime_type
+    elif image_path:
+        b64_data, img_mime = _image_to_base64(image_path)
+    elif image_url:
+        b64_data, img_mime = _fetch_image_as_base64(image_url)
+    else:
+        raise ValueError("Provide one of: image_path, image_url, or image_b64.")
+
+    request_body = _build_request_body(b64_data, img_mime)
+    briefing_text, model_id = _invoke_nova(request_body, region)
+
+    return AAOBriefing(text=briefing_text, model=model_id)
 
 
 # ---------------------------------------------------------------------------
@@ -265,11 +269,11 @@ if __name__ == "__main__":
     try:
         if image_arg:
             print(f"\nUsing local image: {image_arg}")
-            briefing = get_aao_briefing(lat=TEST_LAT, lon=TEST_LON, image_path=image_arg)
+            briefing = get_aao_briefing(image_path=image_arg)
         else:
             print(f"\nNo image path given — using OSM tile for Truro, NS")
             print(f"Tile URL: {TEST_IMAGE_URL}")
-            briefing = get_aao_briefing(lat=TEST_LAT, lon=TEST_LON, image_url=TEST_IMAGE_URL)
+            briefing = get_aao_briefing(image_url=TEST_IMAGE_URL)
 
         print(f"\n{briefing}")
         print(f"\n[model: {briefing.model}]")
