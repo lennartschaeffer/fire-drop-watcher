@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Map, { MapRef } from "react-map-gl/maplibre";
 import DeckGL from "@deck.gl/react";
 import {
@@ -36,7 +36,8 @@ const MAP_STYLE = {
 };
 
 const STEPS = 60;
-const FRAME_INTERVAL_MS = 850;
+const FIRE_INTERVAL_MS = 1500;  // fire perimeter advances every 1.5 s (slow, realistic)
+const PLANE_TICK_MS = 80;       // plane interpolation tick — ~12 fps smooth movement
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -219,6 +220,45 @@ function statusIcon(status: string): string {
   return "📡";
 }
 
+/** Circular mean of an array of degree angles (handles 0°/360° wraparound). */
+function circularMean(angles: number[]): number {
+  if (angles.length === 0) return 0;
+  const sinSum = angles.reduce((s, a) => s + Math.sin((a * Math.PI) / 180), 0);
+  const cosSum = angles.reduce((s, a) => s + Math.cos((a * Math.PI) / 180), 0);
+  return ((Math.atan2(sinSum, cosSum) * 180) / Math.PI + 360) % 360;
+}
+
+/** Scale a GeoJSON ring inward/outward around a center point. */
+function scalePolygon(
+  coords: number[][],
+  center: [number, number],
+  scale: number,
+): number[][] {
+  return coords.map(([lon, lat]) => [
+    center[0] + (lon - center[0]) * scale,
+    center[1] + (lat - center[1]) * scale,
+  ]);
+}
+
+/** Deterministic pseudo-random in [0, 1) from an integer seed. */
+function seededRand(n: number): number {
+  const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+/** Ray-casting point-in-polygon for a GeoJSON ring (array of [lon, lat] pairs). */
+function pointInPolygon(lon: number, lat: number, ring: number[][]): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    if ((yi > lat) !== (yj > lat) && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function FireMap() {
@@ -233,8 +273,12 @@ export default function FireMap() {
   } | null>(null);
   const [status, setStatus] = useState<SimStatus>("idle");
   const [atuFlash, setAtuFlash] = useState<ATUFlash>(null);
+  // 0..1 interpolation factor between currentFrame and currentFrame+1 for planes
+  const [planeT, setPlaneT] = useState(0);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const planeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const frameCountRef = useRef(0);
 
   // Draw mode
   const [drawMode, setDrawMode] = useState(false);
@@ -254,8 +298,10 @@ export default function FireMap() {
 
   function handleSimulate() {
     if (intervalRef.current) clearInterval(intervalRef.current);
+    if (planeIntervalRef.current) clearInterval(planeIntervalRef.current);
     setFrames([]);
     setCurrentFrame(0);
+    setPlaneT(0);
     setStatus("loading");
     setAtuFlash(null);
 
@@ -271,24 +317,33 @@ export default function FireMap() {
         setFrames(data.frames);
         setStatus("playing");
 
-        let frame = 0;
+        // ── Fire interval: slow perimeter advance ──────────────────────────
+        frameCountRef.current = 0;
         intervalRef.current = setInterval(() => {
-          frame += 1;
-          if (frame >= data.frames.length) {
+          frameCountRef.current += 1;
+          if (frameCountRef.current >= data.frames.length) {
             clearInterval(intervalRef.current!);
+            clearInterval(planeIntervalRef.current!);
             setStatus("done");
           } else {
-            setCurrentFrame(frame);
+            const f = frameCountRef.current;
+            setCurrentFrame(f);
+            setPlaneT(0); // reset interpolation at each new fire frame
 
             // Trigger ATU flash
-            const atu = data.frames[frame]?.properties?.atu_event;
+            const atu = data.frames[f]?.properties?.atu_event;
             if (atu === "door_open" || atu === "door_close") {
               if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
               setAtuFlash({ event: atu, expiresAt: Date.now() + 2500 });
               flashTimerRef.current = setTimeout(() => setAtuFlash(null), 2500);
             }
           }
-        }, FRAME_INTERVAL_MS);
+        }, FIRE_INTERVAL_MS);
+
+        // ── Plane tick: fast position interpolation ────────────────────────
+        planeIntervalRef.current = setInterval(() => {
+          setPlaneT((t) => Math.min(t + PLANE_TICK_MS / FIRE_INTERVAL_MS, 1));
+        }, PLANE_TICK_MS);
       })
       .catch(() => setStatus("idle"));
   }
@@ -296,6 +351,7 @@ export default function FireMap() {
   useEffect(
     () => () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
+      if (planeIntervalRef.current) clearInterval(planeIntervalRef.current);
       if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
     },
     [],
@@ -425,6 +481,17 @@ export default function FireMap() {
     }
   }
 
+  // ── Interpolation helpers ────────────────────────────────────────────────
+  function lerp(a: number, b: number, t: number): number {
+    return a + (b - a) * t;
+  }
+  function lerpAngle(a: number, b: number, t: number): number {
+    // JS % preserves sign of dividend, so normalise with +540 before the second %
+    // e.g. 350° → 10°: raw diff = -340; (-340 % 360 + 540) % 360 - 180 = 20 ✓
+    const diff = ((((b - a) % 360) + 540) % 360) - 180;
+    return a + diff * t;
+  }
+
   const activeFeature = frames[currentFrame] ?? null;
   const props = activeFeature?.properties;
   const severity = props?.fire_severity ?? 0;
@@ -432,47 +499,182 @@ export default function FireMap() {
   const tanker = props?.tanker ?? null;
   const simStatus = props?.sim_status ?? "";
 
-  const arrowData: PerimeterArrow[] =
+  // Interpolate plane positions between currentFrame and currentFrame+1
+  const nextProps = frames[Math.min(currentFrame + 1, frames.length - 1)]?.properties;
+
+  const interpBirdDog: AircraftData | null = birdDog
+    ? {
+        visible: birdDog.visible,
+        lat: nextProps?.bird_dog ? lerp(birdDog.lat, nextProps.bird_dog.lat, planeT) : birdDog.lat,
+        lon: nextProps?.bird_dog ? lerp(birdDog.lon, nextProps.bird_dog.lon, planeT) : birdDog.lon,
+        heading_deg: nextProps?.bird_dog
+          ? lerpAngle(birdDog.heading_deg, nextProps.bird_dog.heading_deg, planeT)
+          : birdDog.heading_deg,
+      }
+    : null;
+
+  const interpTanker: AircraftData | null = tanker
+    ? {
+        visible: tanker.visible,
+        lat: nextProps?.tanker ? lerp(tanker.lat, nextProps.tanker.lat, planeT) : tanker.lat,
+        lon: nextProps?.tanker ? lerp(tanker.lon, nextProps.tanker.lon, planeT) : tanker.lon,
+        heading_deg: nextProps?.tanker
+          ? lerpAngle(tanker.heading_deg, nextProps.tanker.heading_deg, planeT)
+          : tanker.heading_deg,
+      }
+    : null;
+
+  // Compute a single averaged direction from all perimeter arrows
+  const perimeterArrows: PerimeterArrow[] =
     activeFeature?.properties.perimeter_arrows ?? [];
+  const centerLon = activeFeature?.properties.center_lon ?? 0;
+  const centerLat = activeFeature?.properties.center_lat ?? 0;
+  const radiusKm = activeFeature?.properties.radius_km ?? 1;
+  const center: [number, number] = [centerLon, centerLat];
+
+  // ── Ember particles — flicker at plane-tick rate (~12 fps) ─────────────────
+  interface Ember {
+    position: [number, number];
+    color: [number, number, number, number];
+    size: number;
+  }
+  const embers = useMemo<Ember[]>(() => {
+    if (!activeFeature) return [];
+    const ring = activeFeature.geometry.coordinates[0];
+    // Bounding box for fast candidate generation
+    const lons = ring.map((p) => p[0]);
+    const lats = ring.map((p) => p[1]);
+    const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+    const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+    const dLon = maxLon - minLon, dLat = maxLat - minLat;
+    const tickSeed = Math.round(planeT * 1000);
+    const pts: Ember[] = [];
+    let attempt = 0;
+    while (pts.length < 300 && attempt < 1400) {
+      const s = currentFrame * 2311 + tickSeed * 97 + attempt;
+      const lon = minLon + seededRand(s) * dLon;
+      const lat = minLat + seededRand(s + 4999) * dLat;
+      if (pointInPolygon(lon, lat, ring)) {
+        const t = seededRand(s + 200);
+        const alpha = Math.round(40 + seededRand(s + 300) * 80); // half opacity
+        let color: [number, number, number, number];
+        if (t < 0.10)      color = [255, 255, 225, alpha]; // white-hot
+        else if (t < 0.28) color = [255, 220, 50,  alpha]; // bright yellow
+        else if (t < 0.58) color = [255, 115, 10,  alpha]; // deep orange
+        else if (t < 0.80) color = [210, 42,  5,   alpha]; // red-orange
+        else               color = [135, 12,  0,   alpha]; // dark ember
+        const size = 0.5 + seededRand(s + 400) * 1.8;     // smaller sparks
+        pts.push({ position: [lon, lat], color, size });
+      }
+      attempt++;
+    }
+    return pts;
+  }, [currentFrame, planeT]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Perimeter arrow SVG — severity-keyed so deck.gl atlas has ≤3 entries
+  function perimeterArrowIcon(s: number): { url: string; width: number; height: number; anchorX: number; anchorY: number } {
+    const fill = s < 0.4 ? "#fbbf24" : s < 0.72 ? "#f97316" : "#ef4444";
+    return {
+      url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
+        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="64" height="64">
+          <polygon points="16,0 24.5,27 16,21.5 7.5,27" fill="${fill}" fill-opacity="0.22"/>
+          <polygon points="16,3 22,25 16,19.5 10,25" fill="${fill}" stroke="white" stroke-width="1.7" stroke-linejoin="round"/>
+          <polygon points="16,3 19.5,12 16,10.5 12.5,12" fill="white" fill-opacity="0.48"/>
+        </svg>`,
+      )}`,
+      width: 64,
+      height: 64,
+      anchorX: 32,
+      anchorY: 32,
+    };
+  }
 
   const fireLayers = activeFeature
     ? [
+        // 1. Outermost atmosphere haze — very wide, near-transparent orange bloom
+        new ScatterplotLayer({
+          id: "fire-haze",
+          data: [{ position: center }],
+          getPosition: (d) => d.position,
+          getFillColor: [255, 70, 0, 18],
+          getRadius: radiusKm * 1400,
+          updateTriggers: { getPosition: [currentFrame] },
+        }),
+        // 2. Outer perimeter polygon — dark red-orange, defines the fire boundary
         new PolygonLayer({
-          id: "fire-perimeter",
+          id: "fire-outer",
           data: [activeFeature.geometry.coordinates[0]],
           getPolygon: (d) => d,
-          getFillColor: severityColor(severity),
+          getFillColor: [200, 30, 0, 90],
           getLineColor: severityLineColor(severity),
           getLineWidth: 3,
           lineWidthUnits: "pixels",
           filled: true,
           stroked: true,
           pickable: false,
+          updateTriggers: { getFillColor: [severity], getLineColor: [severity] },
+        }),
+        // 3. Mid zone — brighter orange, 70% of perimeter
+        new PolygonLayer({
+          id: "fire-mid",
+          data: [scalePolygon(activeFeature.geometry.coordinates[0], center, 0.70)],
+          getPolygon: (d) => d,
+          getFillColor: [255, 95, 0, 130],
+          filled: true,
+          stroked: false,
+          pickable: false,
+          updateTriggers: { getFillColor: [severity] },
+        }),
+        // 4. Inner zone — yellow-orange, 44% of perimeter
+        new PolygonLayer({
+          id: "fire-inner",
+          data: [scalePolygon(activeFeature.geometry.coordinates[0], center, 0.44)],
+          getPolygon: (d) => d,
+          getFillColor: [255, 180, 20, 165],
+          filled: true,
+          stroked: false,
+          pickable: false,
+          updateTriggers: { getFillColor: [severity] },
+        }),
+        // 5. White-hot core, 18% of perimeter
+        new PolygonLayer({
+          id: "fire-core",
+          data: [scalePolygon(activeFeature.geometry.coordinates[0], center, 0.18)],
+          getPolygon: (d) => d,
+          getFillColor: [255, 245, 195, 210],
+          filled: true,
+          stroked: false,
+          pickable: false,
+        }),
+        // 6. Ember / spark particles — tight inside the polygon, flicker at ~12 fps
+        new ScatterplotLayer<Ember>({
+          id: "fire-embers",
+          data: embers,
+          getPosition: (d) => d.position,
+          getFillColor: (d) => d.color,
+          getRadius: (d) => d.size,
+          radiusUnits: "pixels",
           updateTriggers: {
-            getFillColor: [severity],
-            getLineColor: [severity],
+            getPosition: [currentFrame, planeT],
+            getFillColor: [currentFrame, planeT],
+            getRadius:    [currentFrame, planeT],
           },
         }),
+        // 7. Perimeter direction arrows — redesigned, severity-colored
         new IconLayer<PerimeterArrow>({
           id: "fire-direction-arrows",
-          data: arrowData,
+          data: perimeterArrows,
           getPosition: (d) => [d.lon, d.lat],
-          getIcon: () => ({
-            url: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(
-              `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 32 32">
-                <polygon points="16,2 22,22 16,18 10,22" fill="#f97316" stroke="white" stroke-width="1.5"/>
-              </svg>`,
-            )}`,
-            width: 64,
-            height: 64,
-            anchorX: 32,
-            anchorY: 32,
-          }),
-          getSize: 32,
+          getIcon: (d) => perimeterArrowIcon(d.severity),
+          getSize: 40,
           getAngle: (d) => -d.direction,
           billboard: false,
           sizeUnits: "pixels",
-          updateTriggers: { getAngle: [currentFrame] },
+          updateTriggers: {
+            getAngle:    [currentFrame],
+            getPosition: [currentFrame],
+            getIcon:     [currentFrame],
+          },
         }),
       ]
     : [];
@@ -507,12 +709,12 @@ export default function FireMap() {
   ];
 
   // Bird Dog icon layers — plane body + Snoop Dogg head overlay
-  const birdDogLayer = birdDog?.visible
+  const birdDogLayer = interpBirdDog?.visible
     ? [
-        // Plane body
+        // Plane body — SVG nose is at bottom (south at 0°), so add 180° to face heading
         new IconLayer<AircraftData>({
           id: "bird-dog-plane",
-          data: [birdDog],
+          data: [interpBirdDog],
           getPosition: (d) => [d.lon, d.lat],
           getIcon: () => ({
             url: `data:image/svg+xml;charset=utf-8,${BIRD_DOG_SVG}`,
@@ -522,18 +724,18 @@ export default function FireMap() {
             anchorY: 32,
           }),
           getSize: 80,
-          getAngle: (d) => -d.heading_deg,
+          getAngle: (d) => -d.heading_deg + 180,
           billboard: false,
           sizeUnits: "pixels",
           updateTriggers: {
-            getAngle: [currentFrame],
-            getPosition: [currentFrame],
+            getAngle: [currentFrame, planeT],
+            getPosition: [currentFrame, planeT],
           },
         }),
-        // Snoop Dogg head on top (counter-rotated so face stays upright)
+        // Snoop Dogg head — same rotation so face points in direction of travel
         new IconLayer<AircraftData>({
-          id: "bird-dog-head",
-          data: [birdDog],
+          id: "bird-dog-head", // Snoop Dogg
+          data: [interpBirdDog],
           getPosition: (d) => [d.lon, d.lat],
           getIcon: () => ({
             url: "/snoop-dogg-head.png",
@@ -542,25 +744,25 @@ export default function FireMap() {
             anchorX: 256,
             anchorY: 256,
           }),
-          getSize: 72,
+          getSize: 44,
           getAngle: (d) => -d.heading_deg + 180,
           billboard: false,
           sizeUnits: "pixels",
           updateTriggers: {
-            getAngle: [currentFrame],
-            getPosition: [currentFrame],
+            getAngle: [currentFrame, planeT],
+            getPosition: [currentFrame, planeT],
           },
         }),
       ]
     : [];
 
   // Air Tanker icon layers — plane body + Drake head overlay
-  const tankerLayer = tanker?.visible
+  const tankerLayer = interpTanker?.visible
     ? [
-        // Plane body
+        // Plane body — SVG nose is at bottom (south at 0°), so add 180° to face heading
         new IconLayer<AircraftData>({
           id: "tanker-plane",
-          data: [tanker],
+          data: [interpTanker],
           getPosition: (d) => [d.lon, d.lat],
           getIcon: () => ({
             url: `data:image/svg+xml;charset=utf-8,${TANKER_SVG}`,
@@ -570,18 +772,18 @@ export default function FireMap() {
             anchorY: 32,
           }),
           getSize: 100,
-          getAngle: (d) => -d.heading_deg,
+          getAngle: (d) => -d.heading_deg + 180,
           billboard: false,
           sizeUnits: "pixels",
           updateTriggers: {
-            getAngle: [currentFrame],
-            getPosition: [currentFrame],
+            getAngle: [currentFrame, planeT],
+            getPosition: [currentFrame, planeT],
           },
         }),
-        // Drake head on top (counter-rotated so face stays upright)
+        // Drake head — same rotation so face points in direction of travel
         new IconLayer<AircraftData>({
           id: "tanker-head",
-          data: [tanker],
+          data: [interpTanker],
           getPosition: (d) => [d.lon, d.lat],
           getIcon: () => ({
             url: "/drake-head.png",
@@ -590,13 +792,13 @@ export default function FireMap() {
             anchorX: 256,
             anchorY: 256,
           }),
-          getSize: 60,
+          getSize: 38,
           getAngle: (d) => -d.heading_deg + 180,
           billboard: false,
           sizeUnits: "pixels",
           updateTriggers: {
-            getAngle: [currentFrame],
-            getPosition: [currentFrame],
+            getAngle: [currentFrame, planeT],
+            getPosition: [currentFrame, planeT],
           },
         }),
       ]
@@ -658,7 +860,7 @@ export default function FireMap() {
       {/* Right panel */}
       <div className="absolute top-4 right-4 w-64 rounded-xl bg-black/70 text-white text-sm p-4 space-y-3 backdrop-blur-sm">
         <h2 className="font-semibold text-base text-orange-400">
-          Fire Zone — Nova Scotia
+          Wildfire Zone (Nova Scotia)
         </h2>
         <p className="text-zinc-400 text-xs">
           {lat.toFixed(4)}°N, {Math.abs(lon).toFixed(4)}°W
@@ -711,7 +913,7 @@ export default function FireMap() {
         {prediction && status !== "idle" && (
           <div className="space-y-1">
             <p className="text-zinc-400 text-xs uppercase tracking-wide">
-              Model Prediction
+              Fire Modeling Prediction
             </p>
             <div className="grid grid-cols-2 gap-x-2 gap-y-1 items-center">
               <span className="text-zinc-300">Severity</span>
@@ -727,22 +929,13 @@ export default function FireMap() {
                 {prediction.fire_direction.toFixed(0)}°
               </span>
             </div>
-            <div className="mt-1 h-1.5 rounded bg-zinc-700">
-              <div
-                className="h-1.5 rounded transition-all duration-300"
-                style={{
-                  width: `${prediction.fire_severity * 100}%`,
-                  backgroundColor: `rgb(255, ${Math.round(180 * (1 - prediction.fire_severity))}, 0)`,
-                }}
-              />
-            </div>
           </div>
         )}
 
         {weather && status !== "idle" && (
           <div className="space-y-1">
             <p className="text-zinc-400 text-xs uppercase tracking-wide">
-              Weather
+              Current Weather
             </p>
             <div className="grid grid-cols-2 gap-x-2 gap-y-1">
               <span className="text-zinc-300">Temp</span>
