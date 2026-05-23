@@ -95,6 +95,15 @@ interface FireFeature {
   };
 }
 
+interface FireMeta {
+  fire_id: string;
+  label: string;
+  poly_ha: number;
+  start_date: string;
+  end_date: string;
+  source: string;
+}
+
 interface SimulateResponse {
   frames: FireFeature[];
   weather: WeatherData;
@@ -102,6 +111,7 @@ interface SimulateResponse {
   fuel: FuelData;
   prediction: { fire_direction: number; fire_severity: number };
   steps: number;
+  fire_meta?: FireMeta;   // only present on /simulate-real responses
 }
 
 const API = "http://localhost:8000";
@@ -276,6 +286,11 @@ export default function FireMap() {
   // 0..1 interpolation factor between currentFrame and currentFrame+1 for planes
   const [planeT, setPlaneT] = useState(0);
 
+  // Real satellite-derived fire mode
+  const [selectedFire, setSelectedFire] = useState<string>("barrington");
+  const [fireMeta, setFireMeta] = useState<FireMeta | null>(null);
+  const [dataSource, setDataSource] = useState<"mock" | "satellite">("mock");
+
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const planeIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const frameCountRef = useRef(0);
@@ -304,47 +319,64 @@ export default function FireMap() {
     setPlaneT(0);
     setStatus("loading");
     setAtuFlash(null);
+    setDataSource("mock");
+    setFireMeta(null);
 
-    fetch(
-      `${API}/simulate?lat=${lat}&lon=${lon}&radius_km=2&steps=${STEPS}&seed=42`,
-    )
+    fetch(`${API}/simulate?lat=${lat}&lon=${lon}&radius_km=2&steps=${STEPS}&seed=42`)
       .then((r) => r.json())
-      .then((data: SimulateResponse) => {
-        setWeather(data.weather);
-        setTerrain(data.terrain);
-        setFuel(data.fuel);
-        setPrediction(data.prediction);
-        setFrames(data.frames);
-        setStatus("playing");
+      .then((data: SimulateResponse) => startPlayback(data))
+      .catch(() => setStatus("idle"));
+  }
 
-        // ── Fire interval: slow perimeter advance ──────────────────────────
-        frameCountRef.current = 0;
-        intervalRef.current = setInterval(() => {
-          frameCountRef.current += 1;
-          if (frameCountRef.current >= data.frames.length) {
-            clearInterval(intervalRef.current!);
-            clearInterval(planeIntervalRef.current!);
-            setStatus("done");
-          } else {
-            const f = frameCountRef.current;
-            setCurrentFrame(f);
-            setPlaneT(0); // reset interpolation at each new fire frame
+  // ── Real satellite-derived fire simulation ─────────────────────────────────
 
-            // Trigger ATU flash
-            const atu = data.frames[f]?.properties?.atu_event;
-            if (atu === "door_open" || atu === "door_close") {
-              if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
-              setAtuFlash({ event: atu, expiresAt: Date.now() + 2500 });
-              flashTimerRef.current = setTimeout(() => setAtuFlash(null), 2500);
-            }
-          }
-        }, FIRE_INTERVAL_MS);
+  function startPlayback(data: SimulateResponse) {
+    setWeather(data.weather);
+    setTerrain(data.terrain);
+    setFuel(data.fuel);
+    setPrediction(data.prediction);
+    setFireMeta(data.fire_meta ?? null);
+    setFrames(data.frames);
+    setStatus("playing");
 
-        // ── Plane tick: fast position interpolation ────────────────────────
-        planeIntervalRef.current = setInterval(() => {
-          setPlaneT((t) => Math.min(t + PLANE_TICK_MS / FIRE_INTERVAL_MS, 1));
-        }, PLANE_TICK_MS);
-      })
+    frameCountRef.current = 0;
+    intervalRef.current = setInterval(() => {
+      frameCountRef.current += 1;
+      if (frameCountRef.current >= data.frames.length) {
+        clearInterval(intervalRef.current!);
+        clearInterval(planeIntervalRef.current!);
+        setStatus("done");
+      } else {
+        const f = frameCountRef.current;
+        setCurrentFrame(f);
+        setPlaneT(0);
+        const atu = data.frames[f]?.properties?.atu_event;
+        if (atu === "door_open" || atu === "door_close") {
+          if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+          setAtuFlash({ event: atu, expiresAt: Date.now() + 2500 });
+          flashTimerRef.current = setTimeout(() => setAtuFlash(null), 2500);
+        }
+      }
+    }, FIRE_INTERVAL_MS);
+
+    planeIntervalRef.current = setInterval(() => {
+      setPlaneT((t) => Math.min(t + PLANE_TICK_MS / FIRE_INTERVAL_MS, 1));
+    }, PLANE_TICK_MS);
+  }
+
+  function handleSimulateReal() {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (planeIntervalRef.current) clearInterval(planeIntervalRef.current);
+    setFrames([]);
+    setCurrentFrame(0);
+    setPlaneT(0);
+    setStatus("loading");
+    setAtuFlash(null);
+    setDataSource("satellite");
+
+    fetch(`${API}/simulate-real?fire=${selectedFire}&steps=${STEPS}`)
+      .then((r) => r.json())
+      .then((data: SimulateResponse) => startPlayback(data))
       .catch(() => setStatus("idle"));
   }
 
@@ -858,28 +890,88 @@ export default function FireMap() {
       )}
 
       {/* Right panel */}
-      <div className="absolute top-4 right-4 w-64 rounded-xl bg-black/70 text-white text-sm p-4 space-y-3 backdrop-blur-sm">
-        <h2 className="font-semibold text-base text-orange-400">
-          Wildfire Zone (Nova Scotia)
-        </h2>
-        <p className="text-zinc-400 text-xs">
-          {lat.toFixed(4)}°N, {Math.abs(lon).toFixed(4)}°W
-        </p>
+      <div className="absolute top-4 right-4 w-68 rounded-xl bg-black/70 text-white text-sm p-4 space-y-3 backdrop-blur-sm">
 
-        <button
-          onClick={handleSimulate}
-          disabled={status === "loading" || status === "playing"}
-          className="w-full py-1.5 rounded-lg bg-orange-500 hover:bg-orange-400 disabled:bg-zinc-700 disabled:text-zinc-500 text-white text-xs font-semibold transition-colors"
-        >
-          {status === "loading"
-            ? "Loading…"
-            : status === "playing"
-              ? "Simulating…"
-              : "Simulate"}
-        </button>
+        {/* ── Title / data-source indicator ──────────────────────────── */}
+        <div className="space-y-0.5">
+          <h2 className="font-semibold text-base text-orange-400">
+            Wildfire Zone (Nova Scotia)
+          </h2>
+          {dataSource === "satellite" && fireMeta ? (
+            <p className="text-blue-300 text-xs flex items-center gap-1">
+              <span>🛰️</span>
+              <span className="truncate">{fireMeta.label}</span>
+            </p>
+          ) : (
+            <p className="text-zinc-400 text-xs">
+              {lat.toFixed(4)}°N, {Math.abs(lon).toFixed(4)}°W
+            </p>
+          )}
+        </div>
 
-        {/* Draw drop zone */}
-        <div className="space-y-2">
+        {/* ── Mock simulation ─────────────────────────────────────────── */}
+        <div className="space-y-1.5">
+          <p className="text-zinc-500 text-[10px] uppercase tracking-wide">Synthetic simulation</p>
+          <button
+            onClick={handleSimulate}
+            disabled={status === "loading" || status === "playing"}
+            className="w-full py-1.5 rounded-lg bg-orange-500 hover:bg-orange-400 disabled:bg-zinc-700 disabled:text-zinc-500 text-white text-xs font-semibold transition-colors"
+          >
+            {status === "loading" && dataSource === "mock"
+              ? "Loading…"
+              : status === "playing" && dataSource === "mock"
+                ? "Simulating…"
+                : "Simulate (mock)"}
+          </button>
+        </div>
+
+        {/* ── Real satellite fire simulation ──────────────────────────── */}
+        <div className="space-y-1.5 border-t border-zinc-700 pt-3">
+          <p className="text-zinc-500 text-[10px] uppercase tracking-wide flex items-center gap-1">
+            <span>🛰️</span> Real satellite IR perimeter
+          </p>
+
+          {/* Fire selector */}
+          <select
+            value={selectedFire}
+            onChange={(e) => setSelectedFire(e.target.value)}
+            disabled={status === "loading" || status === "playing"}
+            className="w-full py-1 px-2 rounded-lg bg-zinc-800 border border-zinc-600 text-zinc-200 text-xs disabled:opacity-50 focus:outline-none focus:border-blue-400"
+          >
+            <option value="barrington">🔥 Barrington Lake — 20,265 ha</option>
+            <option value="tantallon">🔥 Tantallon (HRM) — 817 ha</option>
+          </select>
+
+          <button
+            onClick={handleSimulateReal}
+            disabled={status === "loading" || status === "playing"}
+            className="w-full py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-700 disabled:text-zinc-500 text-white text-xs font-semibold transition-colors"
+          >
+            {status === "loading" && dataSource === "satellite"
+              ? "Fetching satellite data…"
+              : status === "playing" && dataSource === "satellite"
+                ? "Playing…"
+                : "Simulate Real Fire"}
+          </button>
+
+          {/* Fire metadata card — shown after a real-fire run */}
+          {fireMeta && dataSource === "satellite" && status !== "idle" && (
+            <div className="rounded-lg bg-blue-950/50 border border-blue-800 px-2.5 py-2 space-y-1">
+              <p className="text-blue-300 text-[10px] uppercase tracking-wide">CWFIS NBAC — Satellite IR</p>
+              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px]">
+                <span className="text-zinc-400">Size</span>
+                <span className="text-zinc-200">{fireMeta.poly_ha.toLocaleString(undefined, {maximumFractionDigits: 0})} ha</span>
+                <span className="text-zinc-400">Start</span>
+                <span className="text-zinc-200">{fireMeta.start_date?.slice(0, 10)}</span>
+                <span className="text-zinc-400">End</span>
+                <span className="text-zinc-200">{fireMeta.end_date?.slice(0, 10)}</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Draw drop zone ───────────────────────────────────────────── */}
+        <div className="space-y-2 border-t border-zinc-700 pt-3">
           <button
             onClick={toggleDrawMode}
             className={`w-full py-1.5 rounded-lg text-xs font-semibold transition-colors ${
@@ -910,18 +1002,16 @@ export default function FireMap() {
           )}
         </div>
 
+        {/* ── Prediction + Weather ─────────────────────────────────────── */}
         {prediction && status !== "idle" && (
-          <div className="space-y-1">
+          <div className="space-y-1 border-t border-zinc-700 pt-3">
             <p className="text-zinc-400 text-xs uppercase tracking-wide">
               Fire Modeling Prediction
             </p>
             <div className="grid grid-cols-2 gap-x-2 gap-y-1 items-center">
               <span className="text-zinc-300">Severity</span>
-              <span
-                className={`font-semibold ${severityTextColor(prediction.fire_severity)}`}
-              >
-                {severityLabel(prediction.fire_severity)} (
-                {(prediction.fire_severity * 100).toFixed(0)}%)
+              <span className={`font-semibold ${severityTextColor(prediction.fire_severity)}`}>
+                {severityLabel(prediction.fire_severity)} ({(prediction.fire_severity * 100).toFixed(0)}%)
               </span>
               <span className="text-zinc-300">Direction</span>
               <span className="flex items-center gap-1.5">
@@ -943,9 +1033,7 @@ export default function FireMap() {
               <span className="text-zinc-300">Humidity</span>
               <span>{weather.humidity}%</span>
               <span className="text-zinc-300">Wind</span>
-              <span>
-                {weather.wind_kph} kph {weather.wind_dir}
-              </span>
+              <span>{weather.wind_kph} kph {weather.wind_dir}</span>
             </div>
           </div>
         )}
@@ -954,6 +1042,16 @@ export default function FireMap() {
           <p className="text-red-400 text-xs">{terrain.error}</p>
         )}
       </div>
+
+      {/* Satellite data badge — bottom-left when in real-fire mode */}
+      {dataSource === "satellite" && status !== "idle" && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-950/90 border border-blue-600 text-blue-200 text-[10px] font-medium backdrop-blur-sm shadow-lg">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+            🛰️ CWFIS NBAC · VIIRS/MODIS IR · Nova Scotia 2023
+          </div>
+        </div>
+      )}
 
       {/* AAO Comms — left side chat panel */}
       {showComms && (
