@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Map from "react-map-gl/maplibre";
 import DeckGL from "@deck.gl/react";
-import { PolygonLayer, IconLayer } from "@deck.gl/layers";
+import { PolygonLayer, IconLayer, PathLayer } from "@deck.gl/layers";
 import "maplibre-gl/dist/maplibre-gl.css";
 
 const INITIAL_VIEW = {
@@ -30,8 +30,10 @@ const MAP_STYLE = {
   layers: [{ id: "esri-satellite", type: "raster" as const, source: "esri" }],
 };
 
-const STEPS = 15;
-const FRAME_INTERVAL_MS = 1200;
+const STEPS = 60;
+const FRAME_INTERVAL_MS = 650;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface WeatherData {
   wind_kph: number;
@@ -61,6 +63,13 @@ interface PerimeterArrow {
   severity: number;
 }
 
+interface AircraftData {
+  lat: number;
+  lon: number;
+  heading_deg: number;
+  visible: boolean;
+}
+
 interface FireFeature {
   type: string;
   geometry: { type: string; coordinates: number[][][] };
@@ -72,6 +81,11 @@ interface FireFeature {
     fire_direction: number;
     fire_severity: number;
     perimeter_arrows: PerimeterArrow[];
+    bird_dog?: AircraftData;
+    tanker?: AircraftData;
+    retardant_line?: [number, number][] | null;
+    atu_event?: "none" | "door_open" | "door_close";
+    sim_status?: string;
   };
 }
 
@@ -87,37 +101,32 @@ interface SimulateResponse {
 const API = "http://localhost:8000";
 
 type SimStatus = "idle" | "loading" | "playing" | "done";
+type ATUFlash = { event: "door_open" | "door_close"; expiresAt: number } | null;
 
-// Map severity 0–1 to RGBA: low=yellow, mid=orange, high=deep red
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 function severityColor(s: number): [number, number, number, number] {
-  const r = 255;
-  const g = Math.round(180 * (1 - s));
-  const b = 0;
-  return [r, g, b, Math.round(40 + 80 * s)];
+  return [255, Math.round(180 * (1 - s)), 0, Math.round(40 + 80 * s)];
 }
 
 function severityLineColor(s: number): [number, number, number, number] {
-  const r = 255;
-  const g = Math.round(160 * (1 - s));
-  const b = 0;
-  return [r, g, b, 220];
+  return [255, Math.round(160 * (1 - s)), 0, 220];
 }
 
 function severityLabel(s: number): string {
   if (s < 0.25) return "Low";
-  if (s < 0.5)  return "Moderate";
+  if (s < 0.5) return "Moderate";
   if (s < 0.75) return "High";
   return "Extreme";
 }
 
 function severityTextColor(s: number): string {
   if (s < 0.25) return "text-yellow-400";
-  if (s < 0.5)  return "text-orange-400";
+  if (s < 0.5) return "text-orange-400";
   if (s < 0.75) return "text-orange-500";
   return "text-red-500";
 }
 
-// Build a simple SVG arrow pointing up (north), rotated to fire_direction
 function ArrowSVG({ direction, size = 32 }: { direction: number; size?: number }) {
   return (
     <svg
@@ -136,15 +145,73 @@ function ArrowSVG({ direction, size = 32 }: { direction: number; size?: number }
   );
 }
 
+// Plane SVGs — both point north (up) at 0°; DeckGL rotates by heading.
+// getAngle in DeckGL IconLayer: 0 = up, clockwise positive.
+// We pass -(heading_deg) because DeckGL rotates counter-clockwise from north.
+
+const BIRD_DOG_SVG = encodeURIComponent(`
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="64" height="64">
+  <!-- fuselage -->
+  <ellipse cx="16" cy="16" rx="2.5" ry="11" fill="white"/>
+  <!-- main wings -->
+  <ellipse cx="16" cy="19" rx="13" ry="2.2" fill="white"/>
+  <!-- tail fin -->
+  <ellipse cx="16" cy="8"  rx="5"  ry="1.4" fill="white"/>
+  <!-- nose -->
+  <ellipse cx="16" cy="27" rx="2"  ry="1.5" fill="#d1d5db"/>
+</svg>
+`);
+
+const TANKER_SVG = encodeURIComponent(`
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="64" height="64">
+  <!-- fuselage (thicker, boxy belly) -->
+  <rect x="13" y="6" width="6" height="20" rx="2.5" fill="#fbbf24"/>
+  <!-- wide wings -->
+  <rect x="2" y="18" width="28" height="3.5" rx="1.5" fill="#fbbf24"/>
+  <!-- tail fins -->
+  <rect x="12" y="6" width="8" height="4" rx="1" fill="#f59e0b"/>
+  <!-- retardant belly tank -->
+  <rect x="13.5" y="16" width="5" height="7" rx="1" fill="#dc2626"/>
+</svg>
+`);
+
+// Status label → colour class for the banner
+function statusColor(status: string): string {
+  if (status.includes("reconnaissance")) return "bg-sky-900/80 border-sky-500 text-sky-200";
+  if (status.includes("en route"))        return "bg-yellow-900/80 border-yellow-500 text-yellow-200";
+  if (status.includes("on approach"))     return "bg-amber-900/80 border-amber-400 text-amber-200";
+  if (status.includes("observing"))       return "bg-orange-900/80 border-orange-400 text-orange-200";
+  if (status.includes("in progress"))     return "bg-red-900/80 border-red-500 text-red-200";
+  if (status.includes("complete"))        return "bg-green-900/80 border-green-500 text-green-200";
+  if (status.includes("returning"))       return "bg-zinc-800/80 border-zinc-500 text-zinc-300";
+  return "bg-zinc-800/80 border-zinc-600 text-zinc-300";
+}
+
+function statusIcon(status: string): string {
+  if (status.includes("reconnaissance")) return "🛩";
+  if (status.includes("en route"))        return "✈️";
+  if (status.includes("on approach"))     return "✈️";
+  if (status.includes("observing"))       return "👁";
+  if (status.includes("in progress"))     return "🔴";
+  if (status.includes("complete"))        return "✅";
+  if (status.includes("returning"))       return "🏠";
+  return "📡";
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export default function FireMap() {
-  const [frames, setFrames] = useState<FireFeature[]>([]);
+  const [frames, setFrames]         = useState<FireFeature[]>([]);
   const [currentFrame, setCurrentFrame] = useState(0);
-  const [weather, setWeather] = useState<WeatherData | null>(null);
-  const [terrain, setTerrain] = useState<TerrainData | null>(null);
-  const [fuel, setFuel] = useState<FuelData | null>(null);
+  const [weather, setWeather]       = useState<WeatherData | null>(null);
+  const [terrain, setTerrain]       = useState<TerrainData | null>(null);
+  const [fuel, setFuel]             = useState<FuelData | null>(null);
   const [prediction, setPrediction] = useState<{ fire_direction: number; fire_severity: number } | null>(null);
-  const [status, setStatus] = useState<SimStatus>("idle");
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [status, setStatus]         = useState<SimStatus>("idle");
+  const [atuFlash, setAtuFlash]     = useState<ATUFlash>(null);
+
+  const intervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const lat = INITIAL_VIEW.latitude;
   const lon = INITIAL_VIEW.longitude;
@@ -154,8 +221,9 @@ export default function FireMap() {
     setFrames([]);
     setCurrentFrame(0);
     setStatus("loading");
+    setAtuFlash(null);
 
-    fetch(`${API}/simulate?lat=${lat}&lon=${lon}&radius_km=2&steps=${STEPS}`)
+    fetch(`${API}/simulate?lat=${lat}&lon=${lon}&radius_km=2&steps=${STEPS}&seed=42`)
       .then((r) => r.json())
       .then((data: SimulateResponse) => {
         setWeather(data.weather);
@@ -173,21 +241,38 @@ export default function FireMap() {
             setStatus("done");
           } else {
             setCurrentFrame(frame);
+
+            // Trigger ATU flash
+            const atu = data.frames[frame]?.properties?.atu_event;
+            if (atu === "door_open" || atu === "door_close") {
+              if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+              setAtuFlash({ event: atu, expiresAt: Date.now() + 2500 });
+              flashTimerRef.current = setTimeout(() => setAtuFlash(null), 2500);
+            }
           }
         }, FRAME_INTERVAL_MS);
       })
       .catch(() => setStatus("idle"));
   }
 
-  useEffect(() => () => { if (intervalRef.current) clearInterval(intervalRef.current); }, []);
+  useEffect(() => () => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+  }, []);
 
   const activeFeature = frames[currentFrame] ?? null;
-  const props = activeFeature?.properties;
-  const severity = props?.fire_severity ?? 0;
+  const props         = activeFeature?.properties;
+  const severity      = props?.fire_severity ?? 0;
 
-  const arrowData: PerimeterArrow[] = activeFeature?.properties.perimeter_arrows ?? [];
+  const arrowData: PerimeterArrow[] = props?.perimeter_arrows ?? [];
+  const simStatus   = props?.sim_status ?? "";
+  const birdDog     = props?.bird_dog;
+  const tanker      = props?.tanker;
+  const retardantLine = props?.retardant_line;
 
-  const layers = activeFeature
+  // ── Build DeckGL layers ────────────────────────────────────────────────────
+
+  const fireLayers = activeFeature
     ? [
         new PolygonLayer({
           id: "fire-perimeter",
@@ -200,10 +285,7 @@ export default function FireMap() {
           filled: true,
           stroked: true,
           pickable: false,
-          updateTriggers: {
-            getFillColor: [severity],
-            getLineColor: [severity],
-          },
+          updateTriggers: { getFillColor: [severity], getLineColor: [severity] },
         }),
         new IconLayer<PerimeterArrow>({
           id: "fire-direction-arrows",
@@ -229,12 +311,150 @@ export default function FireMap() {
       ]
     : [];
 
+  // Retardant line layer
+  const retardantLayer =
+    retardantLine && retardantLine.length >= 2
+      ? [
+          new PathLayer({
+            id: "retardant-line",
+            data: [retardantLine],
+            getPath: (d) => d,
+            getColor: [255, 60, 120, 230],
+            getWidth: 80,
+            widthUnits: "meters",
+            widthMinPixels: 3,
+            capRounded: true,
+            updateTriggers: { getPath: [currentFrame] },
+          }),
+        ]
+      : [];
+
+  // Bird Dog icon layers — plane body + Snoop Dogg head overlay
+  const birdDogLayer =
+    birdDog?.visible
+      ? [
+          // Plane body
+          new IconLayer<AircraftData>({
+            id: "bird-dog-plane",
+            data: [birdDog],
+            getPosition: (d) => [d.lon, d.lat],
+            getIcon: () => ({
+              url: `data:image/svg+xml;charset=utf-8,${BIRD_DOG_SVG}`,
+              width: 64,
+              height: 64,
+              anchorX: 32,
+              anchorY: 32,
+            }),
+            getSize: 80,
+            getAngle: (d) => -d.heading_deg,
+            billboard: false,
+            sizeUnits: "pixels",
+            updateTriggers: { getAngle: [currentFrame], getPosition: [currentFrame] },
+          }),
+          // Snoop Dogg head on top (counter-rotated so face stays upright)
+          new IconLayer<AircraftData>({
+            id: "bird-dog-head",
+            data: [birdDog],
+            getPosition: (d) => [d.lon, d.lat],
+            getIcon: () => ({
+              url: "/snoop-dogg-head.png",
+              width: 512,
+              height: 512,
+              anchorX: 256,
+              anchorY: 256,
+            }),
+            getSize: 72,
+            getAngle: (d) => -d.heading_deg + 180,
+            billboard: false,
+            sizeUnits: "pixels",
+            updateTriggers: { getAngle: [currentFrame], getPosition: [currentFrame] },
+          }),
+        ]
+      : [];
+
+  // Air Tanker icon layers — plane body + Drake head overlay
+  const tankerLayer =
+    tanker?.visible
+      ? [
+          // Plane body
+          new IconLayer<AircraftData>({
+            id: "tanker-plane",
+            data: [tanker],
+            getPosition: (d) => [d.lon, d.lat],
+            getIcon: () => ({
+              url: `data:image/svg+xml;charset=utf-8,${TANKER_SVG}`,
+              width: 64,
+              height: 64,
+              anchorX: 32,
+              anchorY: 32,
+            }),
+            getSize: 100,
+            getAngle: (d) => -d.heading_deg,
+            billboard: false,
+            sizeUnits: "pixels",
+            updateTriggers: { getAngle: [currentFrame], getPosition: [currentFrame] },
+          }),
+          // Drake head on top (counter-rotated so face stays upright)
+          new IconLayer<AircraftData>({
+            id: "tanker-head",
+            data: [tanker],
+            getPosition: (d) => [d.lon, d.lat],
+            getIcon: () => ({
+              url: "/drake-head.png",
+              width: 512,
+              height: 512,
+              anchorX: 256,
+              anchorY: 256,
+            }),
+            getSize: 60,
+            getAngle: (d) => -d.heading_deg + 180,
+            billboard: false,
+            sizeUnits: "pixels",
+            updateTriggers: { getAngle: [currentFrame], getPosition: [currentFrame] },
+          }),
+        ]
+      : [];
+
+  const layers = [...fireLayers, ...retardantLayer, ...birdDogLayer, ...tankerLayer];
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+
   return (
     <div className="relative w-full h-full">
       <DeckGL initialViewState={INITIAL_VIEW} controller={true} layers={layers}>
         <Map mapStyle={MAP_STYLE} />
       </DeckGL>
 
+      {/* ATU Status Banner — top-centre */}
+      {simStatus && (status === "playing" || status === "done") && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+          <div
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-sm font-semibold backdrop-blur-sm shadow-lg transition-all duration-500 ${statusColor(simStatus)}`}
+          >
+            <span className="text-base">{statusIcon(simStatus)}</span>
+            <span>{simStatus}</span>
+          </div>
+        </div>
+      )}
+
+      {/* ATU Door Event Flash */}
+      {atuFlash && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20 pointer-events-none animate-pulse">
+          <div
+            className={`flex items-center gap-2 px-4 py-2 rounded-xl border text-xs font-bold backdrop-blur-sm shadow-xl ${
+              atuFlash.event === "door_open"
+                ? "bg-red-950/90 border-red-400 text-red-300"
+                : "bg-green-950/90 border-green-400 text-green-300"
+            }`}
+          >
+            {atuFlash.event === "door_open"
+              ? "🔴 ATU: DOOR OPEN — Drop commencing"
+              : "✅ ATU: DOOR CLOSE — Retardant line complete"}
+          </div>
+        </div>
+      )}
+
+      {/* Right panel */}
       <div className="absolute top-4 right-4 w-64 rounded-xl bg-black/70 text-white text-sm p-4 space-y-3 backdrop-blur-sm">
         <h2 className="font-semibold text-base text-orange-400">Fire Zone — Nova Scotia</h2>
         <p className="text-zinc-400 text-xs">
@@ -254,15 +474,36 @@ export default function FireMap() {
             <p className="text-zinc-400 text-xs uppercase tracking-wide">Simulation</p>
             <div className="grid grid-cols-2 gap-x-2 gap-y-1">
               <span className="text-zinc-300">Step</span>
-              <span>{props.step + 1} / {STEPS}</span>
+              <span>{props.step + 1} / {frames.length}</span>
               <span className="text-zinc-300">Radius</span>
               <span>{props.radius_km.toFixed(2)} km</span>
             </div>
             <div className="mt-1 h-1 rounded bg-zinc-700">
               <div
                 className="h-1 rounded bg-orange-500 transition-all duration-300"
-                style={{ width: `${((props.step + 1) / STEPS) * 100}%` }}
+                style={{ width: `${((props.step + 1) / frames.length) * 100}%` }}
               />
+            </div>
+          </div>
+        )}
+
+        {/* Aircraft legend */}
+        {(status === "playing" || status === "done") && (
+          <div className="space-y-1">
+            <p className="text-zinc-400 text-xs uppercase tracking-wide">Aircraft</p>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <span className="w-3 h-3 rounded-full bg-white inline-block" />
+                <span className="text-zinc-300 text-xs">Bird Dog (AAO)</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-3 h-3 rounded-full bg-yellow-400 inline-block" />
+                <span className="text-zinc-300 text-xs">Air Tanker</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-6 h-1.5 rounded bg-pink-500 inline-block" />
+                <span className="text-zinc-300 text-xs">Retardant line</span>
+              </div>
             </div>
           </div>
         )}
