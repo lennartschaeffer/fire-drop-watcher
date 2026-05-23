@@ -1,0 +1,1 @@
+from .terrain import compute_slope, fetch_altitude
