@@ -64,31 +64,13 @@ def _model_id(region: str) -> str:
 # AAO system prompt
 # ---------------------------------------------------------------------------
 AAO_PROMPT = """\
-Role: You are an expert Air Attack Officer (AAO) flying in a Bird Dog aircraft. \
-Your job is to analyze an image of a map showing a designated drop zone and generate \
-a clear, concise target description for an incoming airtanker pilot who will be \
-dropping water or retardant.
-
-Task: Based on the map image and the provided target coordinates, generate a standard \
-"talk-in" briefing. Do not use conversational filler. \
-Speak entirely in standard wildland aviation terminology.
-
-Formatting Rules:
-Output the briefing exactly in the following format:
-
-TARGET LOCATION: [Describe the location relative to the most prominent visual \
-geographic feature, e.g., "Mid-slope on the east side of the main ridge, 2 miles \
-north of the river."]
-APPROACH HEADING: [Suggest a logical final approach heading based on the terrain \
-contours. Airtankers prefer to drop parallel to ridges or flying slightly \
-uphill/downhill, never directly into a blind box canyon.]
-TRIGGER POINT: [Identify a distinct visual feature on the map near the drop zone \
-where the pilot should begin the drop, e.g., "Anchor the drop at the dirt road \
-intersection and drop heading north."]
-HAZARDS: [List any visible towers, power lines, roads, or sharp elevation changes \
-in the flight path. If none are visible, state "No visible hazards on map."]
-EGRESS ROUTE: [Define a safe exit path following the drop that leads to lower \
-elevation or open airspace, e.g., "Immediate right turn, exit down the valley."]
+You are an Air Attack Officer (AAO) in a Bird Dog aircraft directing an airtanker \
+pilot to a drop zone. The pilot cannot see your screen or any digital overlay — \
+they are looking out the cockpit window. Describe the drop zone in one or two \
+plain sentences using only landmarks visible from the air: roads, rivers, \
+ridgelines, lakes, clearcuts, power lines, or buildings. Tell the pilot exactly \
+where to start the drop and where to stop, referenced to those landmarks. \
+No headings, no bullet points, no field labels — just the drop zone description.
 """
 
 
@@ -153,11 +135,12 @@ def _build_request_body(b64_data: str, mime_type: str) -> dict:
                             "source": {"bytes": b64_data},
                         }
                     },
-                    # Drop zone is marked in purple on the image — no coordinates needed
                     {
                         "text": (
-                            "The drop zone is indicated by the purple line drawn on the map. "
-                            "Generate the AAO briefing based on that purple marker."
+                            "The drop zone is marked on this map. "
+                            "Generate the AAO talk-in briefing using only real-world landmarks "
+                            "the airtanker pilot can see from the cockpit. "
+                            "Do not reference any colours, lines, or map overlays."
                         )
                     },
                 ],
