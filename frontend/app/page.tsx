@@ -8,7 +8,7 @@ export default function Home() {
         <h1 className="text-white font-semibold text-sm tracking-wide">
           Drop It Like It&apos;s Hot
         </h1>
-        <span className="text-zinc-500 text-xs ml-2">Wildfire Spread Visualizer</span>
+        <span className="text-zinc-500 text-xs ml-2">Wildfire Response Visualizer</span>
       </header>
       <div className="flex-1 relative">
         <FireMapLoader />
