@@ -8,6 +8,11 @@ from helpers.weatherapi import get_wind, get_temperature, get_humidity, get_prec
 from helpers.mock_fire import generate_fire_perimeter
 from fuel_lookup import get_fuel_at
 from model_inference import predict as model_predict
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from aao_briefing import get_aao_briefing
 
 app = FastAPI(title="Drop It Like It's Hot API", version="0.1.0")
 
@@ -180,3 +185,24 @@ async def simulate(
         "prediction": base_prediction,
         "steps": steps,
     }
+
+class BriefingRequest(BaseModel):
+    image_b64: str          # Base64-encoded map image (drop zone marked in purple)
+    mime_type: str = "image/png"  # e.g. "image/png", "image/jpeg"
+
+
+@app.post("/aao-briefing")
+def aao_briefing(req: BriefingRequest):
+    """
+    Generate an AAO talk-in briefing from a map image.
+    The drop zone must be marked in purple on the image.
+    Send the image as a base64-encoded string in the request body.
+    """
+    try:
+        briefing = get_aao_briefing(
+            image_b64=req.image_b64,
+            mime_type=req.mime_type,
+        )
+        return {"briefing": briefing.text, "model": briefing.model}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
