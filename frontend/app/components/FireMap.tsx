@@ -8,7 +8,6 @@ import {
   IconLayer,
   PathLayer,
   ScatterplotLayer,
-  PathLayer,
 } from "@deck.gl/layers";
 import "maplibre-gl/dist/maplibre-gl.css";
 
@@ -37,7 +36,7 @@ const MAP_STYLE = {
 };
 
 const STEPS = 60;
-const FRAME_INTERVAL_MS = 650;
+const FRAME_INTERVAL_MS = 850;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -429,6 +428,9 @@ export default function FireMap() {
   const activeFeature = frames[currentFrame] ?? null;
   const props = activeFeature?.properties;
   const severity = props?.fire_severity ?? 0;
+  const birdDog = props?.bird_dog ?? null;
+  const tanker = props?.tanker ?? null;
+  const simStatus = props?.sim_status ?? "";
 
   const arrowData: PerimeterArrow[] =
     activeFeature?.properties.perimeter_arrows ?? [];
@@ -503,26 +505,6 @@ export default function FireMap() {
         ]
       : []),
   ];
-
-  const layers = [...fireLayers, ...dropLineLayers];
-
-  // Retardant line layer
-  const retardantLayer =
-    retardantLine && retardantLine.length >= 2
-      ? [
-          new PathLayer({
-            id: "retardant-line",
-            data: [retardantLine],
-            getPath: (d) => d,
-            getColor: [255, 60, 120, 230],
-            getWidth: 80,
-            widthUnits: "meters",
-            widthMinPixels: 3,
-            capRounded: true,
-            updateTriggers: { getPath: [currentFrame] },
-          }),
-        ]
-      : [];
 
   // Bird Dog icon layers — plane body + Snoop Dogg head overlay
   const birdDogLayer = birdDog?.visible
@@ -622,7 +604,7 @@ export default function FireMap() {
 
   const layers = [
     ...fireLayers,
-    ...retardantLayer,
+    ...dropLineLayers,
     ...birdDogLayer,
     ...tankerLayer,
   ];
@@ -726,53 +708,6 @@ export default function FireMap() {
           )}
         </div>
 
-        {props && (status === "playing" || status === "done") && (
-          <div className="space-y-1">
-            <p className="text-zinc-400 text-xs uppercase tracking-wide">
-              Simulation
-            </p>
-            <div className="grid grid-cols-2 gap-x-2 gap-y-1">
-              <span className="text-zinc-300">Step</span>
-              <span>
-                {props.step + 1} / {frames.length}
-              </span>
-              <span className="text-zinc-300">Radius</span>
-              <span>{props.radius_km.toFixed(2)} km</span>
-            </div>
-            <div className="mt-1 h-1 rounded bg-zinc-700">
-              <div
-                className="h-1 rounded bg-orange-500 transition-all duration-300"
-                style={{
-                  width: `${((props.step + 1) / frames.length) * 100}%`,
-                }}
-              />
-            </div>
-          </div>
-        )}
-
-        {/* Aircraft legend */}
-        {(status === "playing" || status === "done") && (
-          <div className="space-y-1">
-            <p className="text-zinc-400 text-xs uppercase tracking-wide">
-              Aircraft
-            </p>
-            <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <span className="w-3 h-3 rounded-full bg-white inline-block" />
-                <span className="text-zinc-300 text-xs">Bird Dog (AAO)</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="w-3 h-3 rounded-full bg-yellow-400 inline-block" />
-                <span className="text-zinc-300 text-xs">Air Tanker</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="w-6 h-1.5 rounded bg-pink-500 inline-block" />
-                <span className="text-zinc-300 text-xs">Retardant line</span>
-              </div>
-            </div>
-          </div>
-        )}
-
         {prediction && status !== "idle" && (
           <div className="space-y-1">
             <p className="text-zinc-400 text-xs uppercase tracking-wide">
@@ -819,43 +754,6 @@ export default function FireMap() {
                 {weather.wind_kph} kph {weather.wind_dir}
               </span>
             </div>
-          </div>
-        )}
-
-        {terrain && !terrain.error && status !== "idle" && (
-          <div className="space-y-1">
-            <p className="text-zinc-400 text-xs uppercase tracking-wide">
-              Terrain
-            </p>
-            <div className="grid grid-cols-2 gap-x-2 gap-y-1">
-              <span className="text-zinc-300">Slope</span>
-              <span>{terrain.slope_degrees}°</span>
-              <span className="text-zinc-300">Aspect</span>
-              <span>{terrain.aspect_degrees}°</span>
-              {terrain.elevation_m !== undefined && (
-                <>
-                  <span className="text-zinc-300">Elevation</span>
-                  <span>{terrain.elevation_m} m</span>
-                </>
-              )}
-            </div>
-          </div>
-        )}
-
-        {fuel && status !== "idle" && (
-          <div className="space-y-1">
-            <p className="text-zinc-400 text-xs uppercase tracking-wide">
-              Fuel
-            </p>
-            <div className="grid grid-cols-2 gap-x-2 gap-y-1">
-              <span className="text-zinc-300">Type</span>
-              <span>{fuel.fuel_type}</span>
-              <span className="text-zinc-300">Risk</span>
-              <span className="capitalize">{fuel.flammability}</span>
-            </div>
-            <p className="text-zinc-500 text-xs leading-tight">
-              {fuel.fuel_description}
-            </p>
           </div>
         )}
 

@@ -168,7 +168,7 @@ def _invoke_nova(request_body: dict, region: Optional[str] = None) -> AAOBriefin
 
     result = json.loads(response["body"].read())
     briefing_text = result["output"]["message"]["content"][0]["text"].strip()
-    return briefing_text, model_id
+    return briefing_text, model_id #type: ignore
 
 
 def get_aao_briefing(
@@ -210,7 +210,7 @@ def get_aao_briefing(
         raise ValueError("Provide one of: image_path, image_url, or image_b64.")
 
     request_body = _build_request_body(b64_data, img_mime)
-    briefing_text, model_id = _invoke_nova(request_body, region)
+    briefing_text, model_id = _invoke_nova(request_body, region) #type: ignore
 
     return AAOBriefing(text=briefing_text, model=model_id)
 

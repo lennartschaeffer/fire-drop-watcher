@@ -135,8 +135,8 @@ def _add_aircraft_to_frames(
     BD_ARC_END_HDG    = round(BD_ARC_END_BRG + 90) % 360  # ≈ 85° (heading NE-ish)
 
     # ── Act boundaries (proportional — works for any step count) ─────────────
-    ACT2_START  = round(total * 0.28)
-    ACT3_START  = round(total * 0.55)
+    ACT2_START  = round(total * 0.48)   # recon runs longer — slowed down
+    ACT3_START  = round(total * 0.57)   # bird-dog joins tanker quickly (9% window)
     DOOR_OPEN   = round(total * 0.67)
     DOOR_CLOSE  = round(total * 0.78)
     ACT4_START  = round(total * 0.85)
