@@ -1,4 +1,4 @@
-# 🔥 Drop It Like It's Hot
+# 🔥 Heatvision
 
 **Real-time aerial firefighting decision support for Air Tactical Group Supervisors (ATGS / Air Attack Officers).**
 
@@ -64,19 +64,19 @@ The FastAPI server runs on `http://localhost:8000`. All endpoints return JSON.
 
 ### Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/simulate` | Animated fire simulation at arbitrary coordinates |
-| `GET` | `/simulate-real` | Simulation using real CWFIS satellite fire perimeter |
-| `GET` | `/fires` | List available real fires with metadata |
-| `GET` | `/fire-perimeter` | Single synthetic fire perimeter polygon |
-| `GET` | `/terrain` | Slope, aspect, and elevation at a point |
-| `GET` | `/weather` | Current weather at a point (WeatherAPI) |
-| `GET` | `/terrain-zones` | Gentle-slope drop zones (Sentinel Hub DEM, or mock fallback) |
-| `GET` | `/shrub-zones` | Shrubland drop zones (Sentinel Hub WorldCover, or mock fallback) |
-| `GET` | `/mock-environment` | Mock shrub + terrain zone overlays for a named fire |
-| `POST` | `/aao-briefing` | AI-generated Air Attack Officer talk-in briefing from a map image |
+| Method | Path                | Description                                                       |
+| ------ | ------------------- | ----------------------------------------------------------------- |
+| `GET`  | `/health`           | Health check                                                      |
+| `GET`  | `/simulate`         | Animated fire simulation at arbitrary coordinates                 |
+| `GET`  | `/simulate-real`    | Simulation using real CWFIS satellite fire perimeter              |
+| `GET`  | `/fires`            | List available real fires with metadata                           |
+| `GET`  | `/fire-perimeter`   | Single synthetic fire perimeter polygon                           |
+| `GET`  | `/terrain`          | Slope, aspect, and elevation at a point                           |
+| `GET`  | `/weather`          | Current weather at a point (WeatherAPI)                           |
+| `GET`  | `/terrain-zones`    | Gentle-slope drop zones (Sentinel Hub DEM, or mock fallback)      |
+| `GET`  | `/shrub-zones`      | Shrubland drop zones (Sentinel Hub WorldCover, or mock fallback)  |
+| `GET`  | `/mock-environment` | Mock shrub + terrain zone overlays for a named fire               |
+| `POST` | `/aao-briefing`     | AI-generated Air Attack Officer talk-in briefing from a map image |
 
 ### `/simulate` — Core Simulation
 
@@ -85,6 +85,7 @@ GET /simulate?lat=44.85&lon=-63.55&radius_km=2.0&steps=60&seed=42
 ```
 
 Returns `steps` GeoJSON frames, each containing:
+
 - Fire perimeter polygon (growing and drifting with wind)
 - Per-vertex spread direction and severity arrows
 - Bird Dog and Air Tanker positions/headings/visibility
@@ -121,20 +122,20 @@ A **Random Forest** model trained on Nova Scotia spring 2023 fire weather data (
 
 ### Inputs
 
-| Category | Features |
-|----------|----------|
-| Location | lat, lon |
-| Weather | wind speed, wind direction (sin/cos), humidity, temperature, precipitation |
-| FWI | FFMC, DMC, DC, BUI, ISI |
-| Terrain | slope, aspect (sin/cos), elevation |
-| Fuel | Canadian FBP fuel type (label-encoded) |
+| Category | Features                                                                   |
+| -------- | -------------------------------------------------------------------------- |
+| Location | lat, lon                                                                   |
+| Weather  | wind speed, wind direction (sin/cos), humidity, temperature, precipitation |
+| FWI      | FFMC, DMC, DC, BUI, ISI                                                    |
+| Terrain  | slope, aspect (sin/cos), elevation                                         |
+| Fuel     | Canadian FBP fuel type (label-encoded)                                     |
 
 ### Outputs
 
-| Output | Description |
-|--------|-------------|
+| Output           | Description                                           |
+| ---------------- | ----------------------------------------------------- |
 | `fire_direction` | Predicted spread bearing (0–360°), ~2.8° circular MAE |
-| `fire_severity` | Normalized fire intensity (0–1), R² = 0.83 |
+| `fire_severity`  | Normalized fire intensity (0–1), R² = 0.83            |
 
 Direction is derived from a physics-based vector formula (wind force + upslope force). Severity is log-normalized Head Fire Intensity (HFI in kW/m) from the Canadian FBP system.
 
@@ -146,12 +147,12 @@ Direction is derived from a physics-based vector formula (wind force + upslope f
 
 The simulation plays out in four acts, designed around real aerial firefighting protocol:
 
-| Act | Frames | What happens |
-|-----|--------|-------------|
-| **Act 1** | 0–30% | Bird Dog performs solo clockwise recon circle; Tanker waits offscreen |
-| **Act 2** | 30–35% | Both aircraft join up and approach from the north |
-| **Act 3** | 35–65% | Tanker executes drop run south over the fire; door opens, retardant line draws, door closes |
-| **Act 4** | 65–100% | Both aircraft depart south and fade out |
+| Act       | Frames  | What happens                                                                                |
+| --------- | ------- | ------------------------------------------------------------------------------------------- |
+| **Act 1** | 0–30%   | Bird Dog performs solo clockwise recon circle; Tanker waits offscreen                       |
+| **Act 2** | 30–35%  | Both aircraft join up and approach from the north                                           |
+| **Act 3** | 35–65%  | Tanker executes drop run south over the fire; door opens, retardant line draws, door closes |
+| **Act 4** | 65–100% | Both aircraft depart south and fade out                                                     |
 
 ATU events (`door_open` / `door_close`) are the trigger that draws the retardant line — mirroring how real Airborne Tracking Unit data works.
 
@@ -163,15 +164,15 @@ Built with **Next.js 16**, **TypeScript**, **DeckGL 9**, and **MapLibre GL**. Ba
 
 ### Layers
 
-| Layer | Library | What it shows |
-|-------|---------|---------------|
-| Fire perimeter | `PolygonLayer` | Animated orange fire boundary |
-| Spread arrows | `ScatterplotLayer` | Per-vertex direction and severity indicators |
-| Retardant line | `PathLayer` | Pink/red deterrent line drawn during the drop |
-| Bird Dog | `IconLayer` | Small aircraft icon with heading |
-| Air Tanker | `IconLayer` | Large aircraft icon with heading and opacity fade |
-| Shrub zones | `HeatmapLayer` | Green heat blobs highlighting high-effectiveness drop areas |
-| Terrain zones | `PolygonLayer` | Blue polygons marking gentle-slope terrain |
+| Layer          | Library            | What it shows                                               |
+| -------------- | ------------------ | ----------------------------------------------------------- |
+| Fire perimeter | `PolygonLayer`     | Animated orange fire boundary                               |
+| Spread arrows  | `ScatterplotLayer` | Per-vertex direction and severity indicators                |
+| Retardant line | `PathLayer`        | Pink/red deterrent line drawn during the drop               |
+| Bird Dog       | `IconLayer`        | Small aircraft icon with heading                            |
+| Air Tanker     | `IconLayer`        | Large aircraft icon with heading and opacity fade           |
+| Shrub zones    | `HeatmapLayer`     | Green heat blobs highlighting high-effectiveness drop areas |
+| Terrain zones  | `PolygonLayer`     | Blue polygons marking gentle-slope terrain                  |
 
 ---
 
@@ -228,10 +229,10 @@ The Sentinel Hub credentials are optional. Without them, `/terrain-zones` and `/
 
 Two real 2023 Nova Scotia fires are included:
 
-| Fire | Date | Area | Description |
-|------|------|------|-------------|
+| Fire         | Date                 | Area      | Description                                                |
+| ------------ | -------------------- | --------- | ---------------------------------------------------------- |
 | `barrington` | May 27 – Jun 2, 2023 | 20,265 ha | Nova Scotia's largest 2023 wildfire, near Shelburne County |
-| `tantallon` | May 28–29, 2023 | 817 ha | Halifax Regional Municipality — forced evacuations |
+| `tantallon`  | May 28–29, 2023      | 817 ha    | Halifax Regional Municipality — forced evacuations         |
 
 Perimeters were sourced from the **Canadian Wildland Fire Information System (CWFIS) National Burned Area Composite (NBAC)** — VIIRS/MODIS infrared satellite detections validated by ground crews. The raw MultiPolygon geometries were convex-hulled and resampled to 40 evenly-spaced vertices. Data is cached locally in `backend/data/`.
 
