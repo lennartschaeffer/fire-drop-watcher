@@ -9,6 +9,9 @@ from helpers.terrain import compute_slope, async_compute_slope
 from helpers.weatherapi import get_weather, get_wind, get_temperature, get_humidity, get_precipitation
 from helpers.mock_fire import generate_fire_perimeter
 from helpers.cwfis_fire_data import load_fire, build_growth_frames, list_fires, _ring_centroid
+from helpers.mock_environment import get_mock_environment
+from helpers.sentinel_terrain import get_terrain_zones as _get_sentinel_terrain_zones
+from helpers.sentinel_shrub import get_shrub_zones as _get_sentinel_shrub_zones
 from fuel_lookup import get_fuel_at
 from model_inference import predict as model_predict
 from aao_briefing import get_aao_briefing
@@ -97,193 +100,168 @@ def _lerp(a: float, b: float, t: float) -> float:
 
 def _add_aircraft_to_frames(
     frames: list[dict],
-    fire_direction: float,    # bearing the fire is spreading toward (degrees)
+    _fire_direction: float,   # unused for aircraft paths — trajectories are deterministic
     origin_lat: float,
     origin_lon: float,
     radius_km: float,
 ) -> None:
     """
     Mutate each frame's properties in-place to add:
-      bird_dog, tanker, retardant_line, atu_event, sim_status
+      bird_dog, tanker, deterrent_line, atu_event, sim_status
 
-    Tanker runs along the LEFT FLANK of the fire, hugging the perimeter edge.
-    It flies PARALLEL to the fire's spread direction (not across it), positioned
-    at the left side of the fire so it lays retardant along the flank.
-    Drop zone is anchored to the ACTUAL fire state at drop time.
+    All aircraft paths are DETERMINISTIC — fixed bearings independent of fire direction.
 
-      Act 1  0 – 48%   Bird Dog clockwise recon arc around the fire
-      Act 2  48 – 57%  Tanker en route from right-flank staging; Bird Dog repositions
-      Act 3  57 – 85%  Drop run hugging the left flank (door_open ~67%, close ~78%)
-      Act 4  85 – 100% Both aircraft depart ahead of fire
+      Act 1  0 – 48%   Bird Dog full clockwise recon circle; Tanker parked at NE start
+      Act 2  48 – 57%  Both fly from NE start → north approach position (joining up)
+      Act 3  57 – 85%  Both fly south over the fire (door_open ~67%, close ~78%)
+      Act 4  85 – 100% Both depart south and fade out
     """
     total = len(frames)
 
-    # ── Directions relative to fire spread ────────────────────────────────────
-    RUN_BEARING  = fire_direction                        # tanker flies same direction as fire spreads
-    RUN_REVERSE  = (fire_direction + 180) % 360          # behind (tanker enters from here)
-    # LEFT/RIGHT here are map-visual: +90 from fire_direction = left side on a north-up map
-    LEFT_FLANK   = (fire_direction + 90) % 360           # visually left on map — drop zone goes here
-    RIGHT_FLANK  = (fire_direction - 90 + 360) % 360    # visually right on map — tanker stages here
+    # ── Fixed bearings (always south drop run, north approach) ───────────────
+    DROP_BEARING     = 180   # both aircraft fly south during the drop
+    APPROACH_BEARING = 0     # approach from north
 
     # ── Act boundaries (proportional — works for any step count) ─────────────
-    ACT2_START  = round(total * 0.48)
-    ACT3_START  = round(total * 0.57)
-    DOOR_OPEN   = round(total * 0.67)
-    DOOR_CLOSE  = round(total * 0.78)
-    ACT4_START  = round(total * 0.85)
+    ACT2_START  = round(total * 0.30)
+    ACT3_START  = round(total * 0.35)
+    DOOR_OPEN   = round(total * 0.52)   # was 0.67 — scaled to sit ~64% into compressed act 3
+    DOOR_CLOSE  = round(total * 0.59)   # was 0.78 — scaled to sit ~86% into compressed act 3
+    ACT4_START  = round(total * 0.65)   # was 0.85 — act 3 compressed from 50% → 30% of frames
 
-    # ── Sample actual fire state at key moments ───────────────────────────────
-    # The fire grows and drifts, so position everything using the actual frame
-    # data at the relevant time rather than the initial origin/radius.
-    def _fire_state(idx: int) -> tuple[float, float, float]:
-        p = frames[min(idx, total - 1)]["properties"]
-        return (
-            p.get("center_lat", origin_lat),
-            p.get("center_lon", origin_lon),
-            p.get("radius_km", radius_km),
-        )
-
-    act1_lat, act1_lon, act1_r = _fire_state(ACT2_START // 2)
-    BD_ARC_RADIUS = act1_r + 4.0   # orbit just outside the perimeter
-
-    tk2_lat, tk2_lon, tk2_r = _fire_state(ACT2_START)
-    dz_lat, dz_lon, dz_r    = _fire_state(DOOR_OPEN)   # fire edge at drop time
-
-    # ── Bird Dog arc params ────────────────────────────────────────────────────
-    BD_ARC_START_OFF = 135.0
-    BD_ARC_SWEEP     = 270.0
-    BD_ARC_START_BRG = (fire_direction + BD_ARC_START_OFF) % 360
-    BD_ARC_END_BRG   = (BD_ARC_START_BRG + BD_ARC_SWEEP) % 360
+    # ── Bird Dog arc: full 360° clockwise, starts NE (higher up, to the right) ─
+    BD_ARC_RADIUS    = radius_km + 4.0   # fixed orbit distance from initial fire edge
+    BD_ARC_START_BRG = 345.0            # NNW — higher up, slightly east of NW
+    BD_ARC_SWEEP     = 360.0            # full clockwise circle
     BD_ARC_END_HDG   = round(BD_ARC_START_BRG + BD_ARC_SWEEP + 90) % 360
 
-    # ── Key waypoints ─────────────────────────────────────────────────────────
-    bd_recon_end_lat, bd_recon_end_lon = _geo_offset(
-        act1_lat, act1_lon, BD_ARC_END_BRG, BD_ARC_RADIUS
-    )
+    # ── Shared start position: NW of fire — both aircraft begin here ──────────
+    start_lat, start_lon = _geo_offset(origin_lat, origin_lon, BD_ARC_START_BRG, BD_ARC_RADIUS)
 
-    # Tanker stages on the RIGHT flank (opposite side from the drop)
-    tk_base_lat, tk_base_lon = _geo_offset(tk2_lat, tk2_lon, RIGHT_FLANK, tk2_r + 6.0)
+    # Tanker waits here during Act 1 (same position as bird dog arc start)
+    tk_base_lat, tk_base_lon = start_lat, start_lon
 
-    # Drop zone: ON the left flank, right at the fire edge — tanker hugs it
-    drop_zone_lat, drop_zone_lon = _geo_offset(dz_lat, dz_lon, LEFT_FLANK, dz_r * 1.0)
+    # ── Drop run: all waypoints locked to start_lon so there is zero lateral
+    #    movement from Act 2 onwards — planes fly straight south only.
+    #    tk_run_start must be SOUTH of start so Act 2 moves southward. ──────────
+    tk_run_start_lat, _ = _geo_offset(start_lat, start_lon, DROP_BEARING, 2.0)
+    tk_run_start_lon = start_lon   # same longitude as NW start — no lateral drift
 
-    # Tanker run: enters from BEHIND (6 km back), exits AHEAD (4 km forward),
-    # flying parallel to fire spread direction along the left flank.
-    tk_run_start_lat, tk_run_start_lon = _geo_offset(drop_zone_lat, drop_zone_lon, RUN_REVERSE, 6.0)
-    tk_run_end_lat,   tk_run_end_lon   = _geo_offset(drop_zone_lat, drop_zone_lon, RUN_BEARING, 4.0)
+    tk_run_end_lat   = _geo_offset(origin_lat, origin_lon, DROP_BEARING, radius_km + 4.0)[0]
+    tk_run_end_lon   = start_lon   # same longitude throughout
 
-    # Retardant line along the tanker path (parallel to fire spread, on the left flank)
-    ret_start_lat, ret_start_lon = _geo_offset(drop_zone_lat, drop_zone_lon, RUN_REVERSE, 1.5)
-    ret_end_lat,   ret_end_lon   = _geo_offset(drop_zone_lat, drop_zone_lon, RUN_BEARING, 1.5)
+    # deterrent line: east-west, centred on the drop longitude (start_lon)
+    ret_start_lat, ret_start_lon = _geo_offset(origin_lat, start_lon, 270, 1.5)  # west end
+    ret_end_lat,   ret_end_lon   = _geo_offset(origin_lat, start_lon,  90, 1.5)  # east end
 
-    # Bird Dog escort start: behind the tanker, slightly toward fire (right side)
-    _bd_behind_lat, _bd_behind_lon = _geo_offset(
-        tk_run_start_lat, tk_run_start_lon, RUN_REVERSE, 1.5
-    )
-    bd_escort_start_lat, bd_escort_start_lon = _geo_offset(
-        _bd_behind_lat, _bd_behind_lon, RIGHT_FLANK, 0.8
-    )
-
-    completed_retardant_line: list | None = None
+    completed_deterrent_line: list | None = None
 
     for i, frame in enumerate(frames):
         props = frame["properties"]
 
-        # ── Act 1: Bird Dog clockwise recon arc, tanker parked on right flank ──
+        # ── Act 1: Bird Dog circles the fire; Tanker waits at NE start ────────
         if i < ACT2_START:
             t = i / max(ACT2_START - 1, 1)
-            arc_angle = BD_ARC_START_BRG + _lerp(0, BD_ARC_SWEEP, t)
+            arc_angle = BD_ARC_START_BRG + t * BD_ARC_SWEEP
             arc_brg   = arc_angle % 360
-            bd_lat, bd_lon = _geo_offset(act1_lat, act1_lon, arc_brg, BD_ARC_RADIUS)
+            bd_lat, bd_lon = _geo_offset(origin_lat, origin_lon, arc_brg, BD_ARC_RADIUS)
             bd_hdg = round(arc_angle + 90) % 360
 
             props["bird_dog"] = {"lat": bd_lat, "lon": bd_lon, "heading_deg": bd_hdg, "visible": True}
-            props["tanker"]   = {"lat": tk_base_lat, "lon": tk_base_lon, "heading_deg": RUN_BEARING, "visible": False}
-            props["retardant_line"] = None
+            props["tanker"]   = {"lat": tk_base_lat, "lon": tk_base_lon, "heading_deg": DROP_BEARING, "visible": False, "opacity": 0.0}
+            props["deterrent_line"] = None
             props["atu_event"]  = "none"
             props["sim_status"] = "Bird Dog performing reconnaissance"
 
-        # ── Act 2: Tanker en route right flank → left flank run-start ────────
+        # ── Act 2: Both fly from NW start → north approach position ───────────
+        #    No lateral drift — bird dog just slots behind-left of the tanker.
         elif i < ACT3_START:
             t = (i - ACT2_START) / max(ACT3_START - ACT2_START - 1, 1)
 
-            tk_lat = _lerp(tk_base_lat,       tk_run_start_lat, t)
-            tk_lon = _lerp(tk_base_lon,       tk_run_start_lon, t)
+            tk_lat = _lerp(tk_base_lat, tk_run_start_lat, t)
+            tk_lon = _lerp(tk_base_lon, tk_run_start_lon, t)
 
-            bd_lat = _lerp(bd_recon_end_lat, bd_escort_start_lat, t)
-            bd_lon = _lerp(bd_recon_end_lon, bd_escort_start_lon, t)
-            bd_hdg = round(_lerp(BD_ARC_END_HDG, RUN_BEARING, t)) % 360
+            # Bird dog: behind (north) and to the left (east, when heading south).
+            # Offset lerps in from 0 so there's no snap at the act boundary.
+            bd_behind_lat, bd_behind_lon = _geo_offset(tk_lat, tk_lon, APPROACH_BEARING, 2.5 * t)
+            bd_lat, bd_lon               = _geo_offset(bd_behind_lat, bd_behind_lon, 90, 1.5 * t)
+            bd_hdg = round(_lerp(BD_ARC_END_HDG, DROP_BEARING, t)) % 360
 
+            # Ease opacity in quadratically so the tanker fades in smoothly
+            tk_opacity = min(1.0, t * t * 3)
             props["bird_dog"] = {"lat": bd_lat, "lon": bd_lon, "heading_deg": bd_hdg, "visible": True}
-            props["tanker"]   = {"lat": tk_lat, "lon": tk_lon, "heading_deg": RUN_BEARING, "visible": True}
-            props["retardant_line"] = None
+            props["tanker"]   = {"lat": tk_lat, "lon": tk_lon, "heading_deg": DROP_BEARING, "visible": True, "opacity": round(tk_opacity, 3)}
+            props["deterrent_line"] = None
             props["atu_event"]  = "none"
-            props["sim_status"] = "Tanker en route" if t < 0.5 else "Tanker on approach"
+            props["sim_status"] = "Joining up" if t < 0.5 else "On approach"
 
-        # ── Act 3: Drop run — hugging the left flank ──────────────────────────
+        # ── Act 3: Both fly south over the fire (drop run) ────────────────────
         elif i < ACT4_START:
             t = (i - ACT3_START) / max(ACT4_START - ACT3_START - 1, 1)
 
             tk_lat = _lerp(tk_run_start_lat, tk_run_end_lat, t)
             tk_lon = _lerp(tk_run_start_lon, tk_run_end_lon, t)
 
-            # Bird dog: slightly AHEAD and toward the fire (right of tanker)
-            bd_fwd_lat, bd_fwd_lon = _geo_offset(tk_lat, tk_lon, RUN_BEARING, 1.0)
-            bd_lat, bd_lon = _geo_offset(bd_fwd_lat, bd_fwd_lon, RIGHT_FLANK, 0.6)
+            # Bird dog stays behind (north) and to the right (east) of the tanker —
+            # same offset it reached at the end of the Act 2 transition.
+            bd_behind_lat, bd_behind_lon = _geo_offset(tk_lat, tk_lon, APPROACH_BEARING, 2.5)
+            bd_lat, bd_lon               = _geo_offset(bd_behind_lat, bd_behind_lon, 90, 1.5)
 
             if i < DOOR_OPEN:
                 atu_event = "none"
-                sim_status = "Approaching left flank"
-                current_retardant = None
+                sim_status = "Approaching drop zone"
+                current_deterrent = None
             elif i == DOOR_OPEN:
                 atu_event = "door_open"
                 sim_status = "Drop in progress"
-                current_retardant = [[ret_start_lon, ret_start_lat], [ret_start_lon, ret_start_lat]]
+                current_deterrent = [[ret_start_lon, ret_start_lat], [ret_start_lon, ret_start_lat]]
             elif i < DOOR_CLOSE:
                 atu_event = "none"
                 sim_status = "Drop in progress"
                 door_t = (i - DOOR_OPEN) / max(DOOR_CLOSE - DOOR_OPEN, 1)
                 partial_end_lat = _lerp(ret_start_lat, ret_end_lat, door_t)
                 partial_end_lon = _lerp(ret_start_lon, ret_end_lon, door_t)
-                current_retardant = [
+                current_deterrent = [
                     [ret_start_lon, ret_start_lat],
                     [partial_end_lon, partial_end_lat],
                 ]
             elif i == DOOR_CLOSE:
                 atu_event = "door_close"
-                sim_status = "Drop complete — retardant line laid"
-                completed_retardant_line = [
+                sim_status = "Drop complete — deterrent line laid"
+                completed_deterrent_line = [
                     [ret_start_lon, ret_start_lat],
                     [ret_end_lon,   ret_end_lat],
                 ]
-                current_retardant = completed_retardant_line
+                current_deterrent = completed_deterrent_line
             else:
                 atu_event = "none"
-                sim_status = "Drop complete — retardant line laid"
-                current_retardant = completed_retardant_line
+                sim_status = "Drop complete — deterrent line laid"
+                current_deterrent = completed_deterrent_line
 
-            props["bird_dog"] = {"lat": bd_lat, "lon": bd_lon, "heading_deg": RUN_BEARING, "visible": True}
-            props["tanker"]   = {"lat": tk_lat, "lon": tk_lon, "heading_deg": RUN_BEARING, "visible": True}
-            props["retardant_line"] = current_retardant
+            props["bird_dog"] = {"lat": bd_lat, "lon": bd_lon, "heading_deg": DROP_BEARING, "visible": True}
+            props["tanker"]   = {"lat": tk_lat, "lon": tk_lon, "heading_deg": DROP_BEARING, "visible": True, "opacity": 1.0}
+            props["deterrent_line"] = current_deterrent
             props["atu_event"]  = atu_event
             props["sim_status"] = sim_status
 
-        # ── Act 4: Both aircraft depart ahead of fire ─────────────────────────
+        # ── Act 4: Both depart south and fade out ─────────────────────────────
         else:
             t = (i - ACT4_START) / max(total - ACT4_START - 1, 1)
 
-            exit_lat, exit_lon = _geo_offset(tk_run_end_lat, tk_run_end_lon, RUN_BEARING, 20.0)
+            exit_lat, exit_lon = _geo_offset(tk_run_end_lat, tk_run_end_lon, DROP_BEARING, 20.0)
             tk_lat = _lerp(tk_run_end_lat, exit_lat, t)
             tk_lon = _lerp(tk_run_end_lon, exit_lon, t)
 
-            bd_fwd_lat, bd_fwd_lon = _geo_offset(tk_lat, tk_lon, RUN_BEARING, 1.0)
-            bd_lat, bd_lon = _geo_offset(bd_fwd_lat, bd_fwd_lon, RIGHT_FLANK, 0.6)
+            # Bird dog stays behind (north) and to the right (east) of tanker through departure —
+            # same relative offset maintained from the drop run.
+            bd_behind_lat, bd_behind_lon = _geo_offset(tk_lat, tk_lon, APPROACH_BEARING, 2.5)
+            bd_lat, bd_lon               = _geo_offset(bd_behind_lat, bd_behind_lon, 90, 1.5)
 
             both_visible = t < 0.85
 
-            props["bird_dog"] = {"lat": bd_lat, "lon": bd_lon, "heading_deg": RUN_BEARING, "visible": both_visible}
-            props["tanker"]   = {"lat": tk_lat, "lon": tk_lon, "heading_deg": RUN_BEARING, "visible": both_visible}
-            props["retardant_line"] = completed_retardant_line
+            props["bird_dog"] = {"lat": bd_lat, "lon": bd_lon, "heading_deg": DROP_BEARING, "visible": both_visible}
+            props["tanker"]   = {"lat": tk_lat, "lon": tk_lon, "heading_deg": DROP_BEARING, "visible": both_visible, "opacity": 1.0}
+            props["deterrent_line"] = completed_deterrent_line
             props["atu_event"]  = "none"
             props["sim_status"] = "Returning to base"
 
@@ -599,6 +577,82 @@ async def simulate_real(
             "source":     fire_record.get("source"),
         },
     }
+
+
+@app.get("/mock-environment")
+def mock_environment(
+    fire: str = Query("barrington", description="fire_id: 'barrington' or 'tantallon'"),
+):
+    """
+    Return mock environment overlay data for the given fire:
+      - shrub_zones: list of shrub heatmap blobs
+      - terrain_zones: list of favorable-terrain polygon rings
+    """
+    return get_mock_environment(fire)
+
+
+@app.get("/terrain-zones")
+async def terrain_zones(
+    lat: float = Query(..., description="Fire centre latitude"),
+    lon: float = Query(..., description="Fire centre longitude"),
+    radius_km: float = Query(25.0, description="Half-width of the DEM tile to analyse"),
+    slope_threshold: float = Query(1.0, description="Max slope (degrees) for 'gentle terrain'"),
+    max_zones: int = Query(3, ge=1, le=6),
+):
+    """
+    Return real gentle-slope terrain zones derived from the Copernicus DEM GLO-30
+    via the Sentinel Hub Process API.
+
+    Requires SENTINELHUB_CLIENT_ID + SENTINELHUB_CLIENT_SECRET in the environment.
+    Falls back to mock terrain zones if those credentials are absent.
+
+    Response shape mirrors /mock-environment's terrain_zones list so the frontend
+    can swap them in without any interface changes.
+    """
+    try:
+        zones = _get_sentinel_terrain_zones(
+            center_lat=lat,
+            center_lon=lon,
+            radius_km=radius_km,
+            slope_threshold_deg=slope_threshold,
+            max_zones=max_zones,
+        )
+        return {"terrain_zones": zones, "source": "sentinel-hub"}
+    except EnvironmentError:
+        # No Sentinel Hub credentials — return mock zones so the UI still works
+        env_data = get_mock_environment("barrington")
+        return {"terrain_zones": env_data["terrain_zones"], "source": "mock-fallback"}
+
+
+@app.get("/shrub-zones")
+async def shrub_zones(
+    lat: float = Query(..., description="Fire centre latitude"),
+    lon: float = Query(..., description="Fire centre longitude"),
+    radius_km: float = Query(25.0, description="Half-width of the WorldCover tile to analyse"),
+    max_zones: int = Query(3, ge=1, le=6),
+):
+    """
+    Return real shrubland zones derived from ESA WorldCover 2020 (class 20)
+    via the Sentinel Hub Process API.
+
+    Requires SENTINELHUB_CLIENT_ID + SENTINELHUB_CLIENT_SECRET in the environment.
+    Falls back to mock shrub zones if those credentials are absent.
+
+    Response shape mirrors /mock-environment's shrub_zones list so the frontend
+    can swap them in without any interface changes.
+    """
+    try:
+        zones = _get_sentinel_shrub_zones(
+            center_lat=lat,
+            center_lon=lon,
+            radius_km=radius_km,
+            max_zones=max_zones,
+        )
+        return {"shrub_zones": zones, "source": "sentinel-hub"}
+    except EnvironmentError:
+        # No Sentinel Hub credentials — return mock zones so the UI still works
+        env_data = get_mock_environment("barrington")
+        return {"shrub_zones": env_data["shrub_zones"], "source": "mock-fallback"}
 
 
 class BriefingRequest(BaseModel):
